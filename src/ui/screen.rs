@@ -32,10 +32,14 @@ impl Screen {
         style: SnapshotStyle,
     ) -> Result<String, String> {
         let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).map_err(|error| error.to_string())?;
-        terminal
-            .draw(|frame| Self::render_impl(frame, view, theme, false))
-            .map_err(|error| error.to_string())?;
+        let mut terminal = match Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(never) => match never {},
+        };
+        match terminal.draw(|frame| Self::render_impl(frame, view, theme, false)) {
+            Ok(_) => {}
+            Err(never) => match never {},
+        };
         Ok(ansi::buffer_to_string(terminal.backend().buffer(), style))
     }
 

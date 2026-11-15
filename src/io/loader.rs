@@ -67,9 +67,7 @@ impl WorkbookLoader {
         if self.request.no_filter {
             for sheet in &mut workbook.sheets {
                 sheet.filter_state.enabled = false;
-                for column in &mut sheet.filter_state.column_enabled {
-                    *column = false;
-                }
+                sheet.filter_state.column_enabled.fill(false);
                 sheet.visibility = VisibilityMap::all(sheet.meta.row_count);
             }
         }

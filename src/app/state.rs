@@ -712,9 +712,7 @@ impl AppState {
         if let Some(sheet) = self.active_sheet_mut() {
             let value = !sheet.filter_state.enabled;
             sheet.filter_state.enabled = value;
-            for column in &mut sheet.filter_state.column_enabled {
-                *column = value;
-            }
+            sheet.filter_state.column_enabled.fill(value);
         }
         self.rebuild_visibility();
     }

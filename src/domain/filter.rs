@@ -422,7 +422,7 @@ fn custom_matches(condition: &CustomCondition, text: &str, numeric: Option<f64>)
     } else {
         cmp_text == target_text
     };
-    let numeric_cmp = numeric.and_then(|value| target_number.map(|target| (value, target)));
+    let numeric_cmp = numeric.zip(target_number);
     match condition.operator.as_str() {
         "equal" => {
             if let Some((value, target)) = numeric_cmp {
