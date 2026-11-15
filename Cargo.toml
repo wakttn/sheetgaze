@@ -1,0 +1,49 @@
+[package]
+name = "sheetgaze"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Terminal spreadsheet viewer for xlsx and csv"
+license = "MIT"
+repository = "https://github.com/wakhtn/sheetgaze"
+
+[dependencies]
+arboard = { version = "3.7", optional = true, default-features = false }
+base64 = "0.23"
+calamine = { version = "0.38", features = ["chrono"] }
+chardetng = "1.0"
+chrono = "0.4"
+clap = { version = "4.6", features = ["derive"] }
+crossterm = "0.29"
+csv = "1.4"
+encoding_rs = "0.8"
+formualizer = "0.14"
+notify = "8.2.2"
+postcard = { version = "1.1", features = ["alloc"] }
+quick-xml = "0.42"
+ratatui = "0.30.2"
+serde = { version = "1.0", features = ["derive"] }
+tempfile = "3.27"
+textwrap = "0.16"
+thiserror = "2.0"
+unicode-width = "0.2"
+zip = "9.5"
+
+[features]
+default = []
+system-clipboard = ["dep:arboard"]
+
+[dev-dependencies]
+assert_cmd = "2.2"
+predicates = "3"
+insta = "1.49"
+rust_xlsxwriter = "0.102"
+
+[profile.release]
+lto = "thin"
+
+# formualizer 0.14.0 does not compile with zip 7.3+ because ZipFile::data_start()
+# became Option<u64> in that release. The fix is already on upstream main; pin the
+# fixed revision until a release includes it, then drop this patch.
+[patch.crates-io]
+formualizer = { git = "https://github.com/psu3d0/formualizer", rev = "f88f74ffc811b4005c988f02ebe420f5d465fff4" }
