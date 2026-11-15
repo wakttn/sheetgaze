@@ -1,0 +1,154 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.*"
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Check tag matches Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [[ -z "$manifest_version" ]]; then
+            echo "::error::Could not read the package version from Cargo.toml"
+            exit 1
+          fi
+          if [[ "$tag_version" != "$manifest_version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest_version"
+            exit 1
+          fi
+          echo "Releasing $manifest_version from tag $GITHUB_REF_NAME"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+  create-release:
+    name: Create draft release
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Create draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; reusing it."
+            exit 0
+          fi
+
+          version="${tag#v}"
+          args=(--verify-tag --draft --generate-notes --title "$tag")
+          if [[ "${version%%+*}" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$tag" "${args[@]}"
+
+  upload-assets:
+    name: Build ${{ matrix.target }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Build and upload archive
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: sheetgaze
+          target: ${{ matrix.target }}
+          archive: sheetgaze-$tag-$target
+          locked: true
+          tar: unix
+          zip: windows
+          include: README.md,LICENSE
+          leading-dir: true
+          checksum: sha256
+          token: ${{ github.token }}
+
+  publish-release:
+    name: Publish release
+    needs: upload-assets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+
+          version="${tag#v}"
+          if [[ "${version%%+*}" == *-* ]]; then
+            gh release edit "$tag" --draft=false --prerelease
+          else
+            gh release edit "$tag" --draft=false --latest
+          fi
+
+          gh release view "$tag" --json url --jq '"Published " + .url'
+          {
+            echo "### Released $tag"
+            echo
+            gh release view "$tag" --json url --jq 'Release URL: <" + .url + ">"'
+          } >> "$GITHUB_STEP_SUMMARY"

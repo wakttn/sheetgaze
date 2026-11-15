@@ -113,6 +113,34 @@ to the upstream revision that contains the fix
 (`f88f74ffc811b4005c988f02ebe420f5d465fff4`); the patch can be removed once a
 release includes it.
 
+## Releases
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) builds and
+publishes a GitHub Release when a version tag is pushed. The tag must match the
+package version in `Cargo.toml`:
+
+```bash
+# 1. Bump `version` in Cargo.toml and refresh Cargo.lock.
+cargo check
+git add Cargo.toml Cargo.lock
+git commit -m "Release v0.2.0"
+git push origin main
+
+# 2. Push the matching tag.
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The workflow runs `cargo fmt --check`, Clippy, and the test suite before
+building. It publishes prebuilt archives for Linux (x86_64, aarch64), macOS
+(Intel, Apple Silicon), and Windows (x86_64), with SHA-256 checksums and
+automatically generated release notes. Prerelease tags such as
+`v0.2.0-rc.1` are marked as prereleases.
+
+The release is created as a draft first. Assets are uploaded to the draft, and
+it is published only after every build succeeds, so a failed build does not
+produce a half-populated public release.
+
 ## Current limitations
 
 - Automatic reload compares the file's existence, size, and modification time only; a rewrite that preserves both size and mtime is not detected. Use `r` in that case.
