@@ -21,6 +21,14 @@ pub struct ScreenView {
     pub help: Option<HelpView>,
     pub search_prompt: Option<SearchPromptView>,
     pub filter_panel: Option<FilterPanelView>,
+    pub input_line: Option<InputLineView>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InputLineView {
+    pub prompt: String,
+    pub text: String,
+    pub cursor: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -36,6 +44,8 @@ pub struct StatusView {
     pub sheet_name: String,
     pub cell_label: String,
     pub mode_label: String,
+    pub dirty: bool,
+    pub fit_label: String,
     pub selection_count: usize,
     pub formula_label: String,
     pub search_label: String,
@@ -76,6 +86,8 @@ pub struct SearchPromptView {
     pub total: usize,
     pub hidden: usize,
     pub searching: bool,
+    pub sheet: Option<String>,
+    pub cell: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]

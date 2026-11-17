@@ -289,7 +289,7 @@ fn status_and_help_expose_reload() {
             .unwrap()
             .bindings
             .iter()
-            .any(|(key, _)| key == "r")
+            .any(|(key, _)| key == ":e / :e!")
     );
     let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
     let theme = Theme::new(sheetgaze::config::ColorMode::Mono);

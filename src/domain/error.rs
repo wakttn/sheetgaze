@@ -93,6 +93,30 @@ pub enum FormulaError {
 }
 
 #[derive(Debug, Error)]
+pub enum SaveError {
+    #[error("editing is only supported for xlsx files")]
+    UnsupportedFormat,
+    #[error("no changes to save")]
+    NoChanges,
+    #[error("cannot write read-only file: {path}")]
+    ReadOnly { path: PathBuf },
+    #[error("cannot write {path}: {message}")]
+    Io { path: PathBuf, message: String },
+    #[error("xlsx zip error: {0}")]
+    Zip(String),
+    #[error("xlsx xml error: {0}")]
+    Xml(String),
+    #[error("unsupported formula edit in {sheet}!{addr}: {message}")]
+    UnsupportedFormula {
+        sheet: String,
+        addr: String,
+        message: String,
+    },
+    #[error("file changed on disk; use :w! to overwrite")]
+    Stale,
+}
+
+#[derive(Debug, Error)]
 pub enum AppError {
     #[error("configuration error: {0}")]
     Config(String),

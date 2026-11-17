@@ -11,12 +11,21 @@ pub fn render(frame: &mut ratatui::Frame, help: &HelpView, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let mut lines = vec!["Navigation  h j k l / arrows, gg G { } 0 ^ $ Ctrl-d Ctrl-u".to_string()];
-    lines.push("Search      / then Enter, n / N, Esc".to_string());
+    lines.push("Search      / then Enter, n / N (works across sheets), * / #".to_string());
+    lines.push(
+        "Edit        i a I A, s clear+edit, = formula, Enter/Tab commit, Esc commit".to_string(),
+    );
+    lines.push(
+        "Edit ops    x clear, r{char} replace, dd clear row, d{motion} clear range".to_string(),
+    );
+    lines.push("History     u undo, Ctrl-r redo, Ctrl-o / Ctrl-i jump back / forward".to_string());
+    lines.push("Command     :w :w! :q :q! :wq :x :e :e! :s :%s :gs :goto".to_string());
     lines.push("Filter      f, Space toggle, a all, c clear, Esc close".to_string());
-    lines.push("Cell        Enter / d detail, v / V select, y copy".to_string());
+    lines.push("Cell        Enter / K detail, v / V select, y copy".to_string());
+    lines.push("View        w fit columns to screen".to_string());
     lines.push("Sheets      Tab / Shift-Tab, ] / [".to_string());
-    lines.push("Reload      r manual reload".to_string());
-    lines.push("Other       ? help, q quit".to_string());
+    lines.push("Reload      :e / :e!, discard with :e!".to_string());
+    lines.push("Other       ? help, q quit, ZZ save quit, ZQ discard quit".to_string());
     lines.push(String::new());
     for (key, description) in &help.bindings {
         lines.push(format!("{key:<12} {description}"));

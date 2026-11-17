@@ -8,7 +8,7 @@ use sheetgaze::domain::addr::CellAddr;
 use sheetgaze::domain::cell::CellValue;
 use sheetgaze::domain::filter::{FilterState, VisibilityMap};
 use sheetgaze::domain::formula::{FormulaCellResult, FormulaResults, FormulaStatus};
-use sheetgaze::domain::layout::{LayoutEngine, Viewport};
+use sheetgaze::domain::layout::{ColumnWidths, LayoutEngine, Viewport};
 use sheetgaze::domain::row_store::LazyConfig;
 use sheetgaze::domain::search::{SearchIndex, SearchMatch, SearchQuery};
 use sheetgaze::domain::sheet::SheetData;
@@ -73,8 +73,9 @@ fn viewport_follows_focus_horizontally_and_marks_the_cursor() {
         width: 40,
     };
     let focus = CellAddr::new(1, 35);
-    let freeze = LayoutEngine::effective_freeze(sheet, &viewport);
-    let viewport_plan = ViewportPlanner::ensure_visible(sheet, &viewport, focus, freeze);
+    let widths = ColumnWidths::from_sheet(sheet);
+    let freeze = LayoutEngine::effective_freeze(sheet, &viewport, &widths);
+    let viewport_plan = ViewportPlanner::ensure_visible(sheet, &viewport, focus, freeze, &widths);
     assert!(
         viewport_plan.left_col > 0,
         "focus at column 35 should scroll horizontally"
@@ -88,6 +89,7 @@ fn viewport_follows_focus_horizontally_and_marks_the_cursor() {
         focus,
         None,
         None,
+        &widths,
     );
     let planned_focus = plan
         .scroll_rows
@@ -117,10 +119,11 @@ fn disabled_freeze_pane_is_not_rendered_as_frozen() {
         height: 20,
         width: 80,
     };
-    let freeze = LayoutEngine::effective_freeze(sheet, &viewport);
+    let widths = ColumnWidths::from_sheet(sheet);
+    let freeze = LayoutEngine::effective_freeze(sheet, &viewport, &widths);
     assert_eq!(freeze.rows, 0);
     assert_eq!(freeze.cols, 0);
-    let plan = LayoutEngine::plan(sheet, &viewport, CellAddr::new(0, 0), None, None);
+    let plan = LayoutEngine::plan(sheet, &viewport, CellAddr::new(0, 0), None, None, &widths);
     assert!(plan.frozen_rows.is_empty());
 }
 
@@ -172,8 +175,9 @@ fn horizontal_scroll_keeps_frozen_columns_without_duplicates() {
         width: 40,
     };
     let focus = CellAddr::new(5, 10);
-    let freeze = LayoutEngine::effective_freeze(sheet, &viewport);
-    let plan = ViewportPlanner::ensure_visible(sheet, &viewport, focus, freeze);
+    let widths = ColumnWidths::from_sheet(sheet);
+    let freeze = LayoutEngine::effective_freeze(sheet, &viewport, &widths);
+    let plan = ViewportPlanner::ensure_visible(sheet, &viewport, focus, freeze, &widths);
     let plan = LayoutEngine::plan(
         sheet,
         &Viewport {
@@ -183,6 +187,7 @@ fn horizontal_scroll_keeps_frozen_columns_without_duplicates() {
         focus,
         None,
         None,
+        &widths,
     );
     assert_eq!(plan.frozen_cols, 1);
     let row = plan
@@ -268,11 +273,12 @@ fn wrap_text_expands_row_height_and_detail_truncation() {
         sheet.layout.row_heights[wrap_addr.row as usize] > 1,
         "wrap_text content should increase row height"
     );
-    let measure = LayoutEngine::measure_cell(sheet, &sheet.layout_limits, wrap_addr);
+    let widths = ColumnWidths::from_sheet(sheet);
+    let measure = LayoutEngine::measure_cell(sheet, wrap_addr, &widths);
     assert!(measure.lines.len() > 1);
     assert_eq!(
         measure.truncated,
-        LayoutEngine::truncated_at(sheet, &sheet.layout_limits, wrap_addr)
+        LayoutEngine::truncated_at(sheet, wrap_addr, &widths)
     );
 }
 
@@ -365,10 +371,12 @@ fn search_syncs_to_the_first_visible_match() {
         SearchQuery::new("hit".to_string()),
         vec![
             SearchMatch {
+                sheet: 0,
                 addr: CellAddr::new(0, 0),
                 source: sheetgaze::domain::search::MatchSource::Display,
             },
             SearchMatch {
+                sheet: 0,
                 addr: CellAddr::new(1, 0),
                 source: sheetgaze::domain::search::MatchSource::Display,
             },

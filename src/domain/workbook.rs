@@ -117,6 +117,7 @@ impl WorkbookModel {
         };
         let cols = sheet.used_range.end.col + 1;
         let range = selection.range(cols);
+        let edits = sheet.edits.clone();
         let mut session = CopySession::start(
             sheet,
             selection,
@@ -136,8 +137,9 @@ impl WorkbookModel {
                     for col in range.cols() {
                         let addr = CellAddr::new(row, col);
                         values.push(
-                            cells
+                            edits
                                 .get(&addr)
+                                .or_else(|| cells.get(&addr))
                                 .map(|cell| effective_with_overlay(&overlay, addr, cell))
                                 .unwrap_or_else(empty_effective),
                         );
@@ -159,7 +161,9 @@ impl WorkbookModel {
                     for col in range.cols() {
                         let addr = CellAddr::new(row.row, col);
                         values.push(
-                            row.cell(col)
+                            edits
+                                .get(&addr)
+                                .or_else(|| row.cell(col))
                                 .map(|cell| effective_with_overlay(&overlay, addr, cell))
                                 .unwrap_or_else(empty_effective),
                         );
@@ -200,6 +204,13 @@ impl WorkbookModel {
                 .insert(update.addr, update.clone());
             if let SheetData::Eager(cells) = &mut sheet.data
                 && let Some(cell) = cells.get_mut(&update.addr)
+                && let Some(formula) = cell.formula.as_mut()
+            {
+                formula.evaluated = Some(update.value.clone());
+                formula.status = update.status.clone();
+                cell.display = display.clone();
+            }
+            if let Some(cell) = sheet.edits.get_mut(&update.addr)
                 && let Some(formula) = cell.formula.as_mut()
             {
                 formula.evaluated = Some(update.value.clone());

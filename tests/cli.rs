@@ -68,6 +68,52 @@ fn print_mode_renders_plain_snapshot() {
 }
 
 #[test]
+fn print_mode_applies_fit_width() {
+    let mut text = String::new();
+    for col in 0..10 {
+        if col > 0 {
+            text.push(',');
+        }
+        text.push_str(&format!("column-{col:02}"));
+    }
+    text.push('\n');
+    for col in 0..10 {
+        if col > 0 {
+            text.push(',');
+        }
+        text.push('1');
+    }
+    text.push('\n');
+    let (_dir, path) = csv_fixture(&text);
+
+    let without = cmd()
+        .args(["--print", "--no-ansi", "--width", "40", "--height", "10"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(without.status.success());
+    let without = String::from_utf8(without.stdout).unwrap();
+    assert!(!without.contains("fit:on"));
+
+    let with = cmd()
+        .args([
+            "--print",
+            "--no-ansi",
+            "--width",
+            "40",
+            "--height",
+            "10",
+            "--fit-width",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(with.status.success());
+    let with = String::from_utf8(with.stdout).unwrap();
+    assert!(with.contains("fit:on"), "fit label missing: {with}");
+}
+
+#[test]
 fn print_mode_emits_ansi_by_default() {
     let (_dir, path) = csv_fixture("Name,Value\nEast,10\n");
     let output = cmd()

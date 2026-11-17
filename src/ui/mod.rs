@@ -3,6 +3,7 @@ pub mod detail;
 pub mod filter_panel;
 pub mod grid;
 pub mod help;
+pub mod input_line;
 pub mod screen;
 pub mod search_prompt;
 pub mod status;

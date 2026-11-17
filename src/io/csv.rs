@@ -100,6 +100,7 @@ pub fn load_csv(
         used_range,
         data_rows: data_rows.finish(),
         data,
+        edits: HashMap::new(),
         merges: MergeIndex::empty(),
         merge_borders: HashMap::new(),
         layout,

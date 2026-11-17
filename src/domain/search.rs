@@ -33,6 +33,7 @@ pub enum MatchSource {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchMatch {
+    pub sheet: usize,
     pub addr: CellAddr,
     pub source: MatchSource,
 }
@@ -43,6 +44,9 @@ pub struct SearchIndex {
     pub matches: Vec<SearchMatch>,
     pub current: Option<usize>,
     pub hidden_matches: usize,
+    /// Sheet whose grid is currently displayed. Only matches on this sheet are
+    /// highlighted.
+    pub active_sheet: usize,
 }
 
 impl SearchIndex {
@@ -53,6 +57,7 @@ impl SearchIndex {
             matches,
             current,
             hidden_matches: 0,
+            active_sheet: 0,
         }
     }
 
@@ -62,11 +67,18 @@ impl SearchIndex {
             matches: Vec::new(),
             current: None,
             hidden_matches: 0,
+            active_sheet: 0,
         }
     }
 
+    pub fn set_active_sheet(&mut self, sheet: usize) {
+        self.active_sheet = sheet;
+    }
+
     pub fn is_match(&self, addr: CellAddr) -> bool {
-        self.matches.iter().any(|matched| matched.addr == addr)
+        self.matches
+            .iter()
+            .any(|matched| matched.sheet == self.active_sheet && matched.addr == addr)
     }
 
     pub fn current_match(&self) -> Option<&SearchMatch> {
@@ -74,40 +86,105 @@ impl SearchIndex {
     }
 
     pub fn sync_visibility(&mut self, visibility: &VisibilityMap) {
+        self.sync_visibility_for(std::slice::from_ref(visibility));
+    }
+
+    pub fn sync_visibility_for(&mut self, visibilities: &[VisibilityMap]) {
         self.hidden_matches = self
             .matches
             .iter()
-            .filter(|matched| !visibility.is_visible(matched.addr.row))
+            .filter(|matched| !is_visible(visibilities, matched.sheet, matched.addr.row))
             .count();
         let current_visible = self.current.is_some_and(|index| {
             self.matches
                 .get(index)
-                .is_some_and(|matched| visibility.is_visible(matched.addr.row))
+                .is_some_and(|matched| is_visible(visibilities, matched.sheet, matched.addr.row))
         });
         if !current_visible {
             self.current = self
                 .matches
                 .iter()
-                .position(|matched| visibility.is_visible(matched.addr.row));
+                .position(|matched| is_visible(visibilities, matched.sheet, matched.addr.row));
         }
     }
 
     pub fn next_visible(&mut self, visibility: &VisibilityMap) -> Option<SearchMatch> {
-        self.step(visibility, true)
+        self.step_in(std::slice::from_ref(visibility), true)
     }
 
     pub fn previous_visible(&mut self, visibility: &VisibilityMap) -> Option<SearchMatch> {
-        self.step(visibility, false)
+        self.step_in(std::slice::from_ref(visibility), false)
     }
 
-    fn step(&mut self, visibility: &VisibilityMap, forward: bool) -> Option<SearchMatch> {
+    pub fn next_visible_in(&mut self, visibilities: &[VisibilityMap]) -> Option<SearchMatch> {
+        self.step_in(visibilities, true)
+    }
+
+    pub fn previous_visible_in(&mut self, visibilities: &[VisibilityMap]) -> Option<SearchMatch> {
+        self.step_in(visibilities, false)
+    }
+
+    /// Selects the next (or previous) visible match relative to an arbitrary
+    /// workbook position, wrapping around when no match remains in that
+    /// direction. Used by `*` / `#`.
+    pub fn select_visible_from(
+        &mut self,
+        sheet: usize,
+        addr: CellAddr,
+        forward: bool,
+        visibilities: &[VisibilityMap],
+    ) -> Option<SearchMatch> {
+        self.hidden_matches = self
+            .matches
+            .iter()
+            .filter(|matched| !is_visible(visibilities, matched.sheet, matched.addr.row))
+            .count();
+        let start = (sheet, addr.row, addr.col);
+        let mut candidate = None;
+        if forward {
+            for (index, matched) in self.matches.iter().enumerate() {
+                if !is_visible(visibilities, matched.sheet, matched.addr.row) {
+                    continue;
+                }
+                if (matched.sheet, matched.addr.row, matched.addr.col) > start {
+                    candidate = Some(index);
+                    break;
+                }
+            }
+            if candidate.is_none() {
+                candidate = self
+                    .matches
+                    .iter()
+                    .position(|matched| is_visible(visibilities, matched.sheet, matched.addr.row));
+            }
+        } else {
+            for (index, matched) in self.matches.iter().enumerate() {
+                if !is_visible(visibilities, matched.sheet, matched.addr.row) {
+                    continue;
+                }
+                if (matched.sheet, matched.addr.row, matched.addr.col) < start {
+                    candidate = Some(index);
+                }
+            }
+            if candidate.is_none() {
+                candidate = self
+                    .matches
+                    .iter()
+                    .rposition(|matched| is_visible(visibilities, matched.sheet, matched.addr.row));
+            }
+        }
+        self.current = candidate;
+        candidate.map(|index| self.matches[index].clone())
+    }
+
+    fn step_in(&mut self, visibilities: &[VisibilityMap], forward: bool) -> Option<SearchMatch> {
         if self.matches.is_empty() {
             return None;
         }
         self.hidden_matches = self
             .matches
             .iter()
-            .filter(|matched| !visibility.is_visible(matched.addr.row))
+            .filter(|matched| !is_visible(visibilities, matched.sheet, matched.addr.row))
             .count();
         let len = self.matches.len();
         let mut index = self.current.unwrap_or(0);
@@ -117,11 +194,53 @@ impl SearchIndex {
             } else {
                 (index + len - 1) % len
             };
-            if visibility.is_visible(self.matches[index].addr.row) {
+            let matched = &self.matches[index];
+            if is_visible(visibilities, matched.sheet, matched.addr.row) {
                 self.current = Some(index);
-                return Some(self.matches[index].clone());
+                return Some(matched.clone());
             }
         }
         None
+    }
+}
+
+fn is_visible(visibilities: &[VisibilityMap], sheet: usize, row: u32) -> bool {
+    visibilities
+        .get(sheet)
+        .map(|visibility| visibility.is_visible(row))
+        .unwrap_or(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_the_first_visible_match_across_sheets() {
+        let mut index = SearchIndex::new(
+            SearchQuery::new("hit".to_string()),
+            vec![
+                SearchMatch {
+                    sheet: 0,
+                    addr: CellAddr::new(0, 0),
+                    source: MatchSource::Display,
+                },
+                SearchMatch {
+                    sheet: 1,
+                    addr: CellAddr::new(2, 1),
+                    source: MatchSource::Display,
+                },
+            ],
+        );
+        let visibilities = [
+            VisibilityMap::from_mask(vec![false]),
+            VisibilityMap::from_mask(vec![true, true, true]),
+        ];
+        index.sync_visibility_for(&visibilities);
+        assert_eq!(index.current_match().unwrap().sheet, 1);
+        assert_eq!(index.hidden_matches, 1);
+        let next = index.next_visible_in(&visibilities).unwrap();
+        assert_eq!(next.sheet, 1);
+        assert_eq!(next.addr, CellAddr::new(2, 1));
     }
 }

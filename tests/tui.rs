@@ -74,6 +74,108 @@ fn renders_grid_and_status() {
 }
 
 #[test]
+fn renders_insert_line_and_dirty_marker() {
+    let path = std::env::temp_dir().join("sheetgaze-tests/edit-line.xlsx");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_worksheet();
+    sheet.write_string(0, 0, "hello").unwrap();
+    workbook.save(&path).unwrap();
+    let workbook = load_xlsx(&path, &Default::default(), &LazyConfig::default()).unwrap();
+    let mut state = AppState::new(workbook, Config::default());
+    state.set_size(80, 24);
+
+    state.apply(Action::EditClear);
+    state.apply(Action::EditInput('x'));
+    let view = state.view();
+    assert_eq!(view.mode, sheetgaze::domain::mode::Mode::Insert);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let theme = Theme::new(sheetgaze::config::ColorMode::Mono);
+    terminal
+        .draw(|frame| Screen::render(frame, &view, &theme))
+        .unwrap();
+    let rendered: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(
+        rendered.contains("A1 >"),
+        "input line should show cell address"
+    );
+    assert!(rendered.contains("INSERT"));
+
+    state.apply(Action::EditCommit(
+        sheetgaze::domain::edit::EditCommit::Stay,
+    ));
+    let view = state.view();
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| Screen::render(frame, &view, &theme))
+        .unwrap();
+    let rendered: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(rendered.contains("[+]"), "dirty marker should be visible");
+}
+
+#[test]
+fn fit_width_renders_the_last_column_and_status() {
+    let path = std::env::temp_dir().join("sheetgaze-tests/fit-width-tui.csv");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut text = String::new();
+    for col in 0..10 {
+        if col > 0 {
+            text.push(',');
+        }
+        text.push_str(&format!("column-{col:02}"));
+    }
+    text.push('\n');
+    for col in 0..10 {
+        if col > 0 {
+            text.push(',');
+        }
+        if col == 9 {
+            text.push('Z');
+        } else {
+            text.push('1');
+        }
+    }
+    text.push('\n');
+    std::fs::write(&path, text).unwrap();
+    let workbook = load_csv(
+        &path,
+        &Default::default(),
+        &LazyConfig {
+            enabled: false,
+            ..LazyConfig::default()
+        },
+        None,
+    )
+    .unwrap();
+    let mut state = AppState::new(workbook, Config::default());
+    state.set_size(80, 10);
+    state.apply(Action::ToggleFitWidth);
+    let view = state.view();
+    assert_eq!(view.plan.columns.last().unwrap().col, 9);
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+    let theme = Theme::new(sheetgaze::config::ColorMode::Mono);
+    terminal
+        .draw(|frame| Screen::render(frame, &view, &theme))
+        .unwrap();
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(rendered.contains("fit:on"), "status missing: {rendered}");
+    assert!(rendered.contains('Z'), "last column missing: {rendered}");
+}
+
+#[test]
 fn renders_excel_border_styles() {
     let workbook = load_xlsx(
         &fixture_dir().join("borders.xlsx"),

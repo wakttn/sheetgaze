@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use sheetgaze::domain::addr::{CellAddr, CellRange};
 use sheetgaze::domain::cell::CellValue;
 use sheetgaze::domain::filter::FilterSource;
-use sheetgaze::domain::layout::{LayoutEngine, LayoutMode, Viewport};
+use sheetgaze::domain::layout::{ColumnWidths, LayoutEngine, LayoutMode, Viewport};
 use sheetgaze::domain::row_store::{LazyConfig, RowRange};
 use sheetgaze::domain::sheet::SheetData;
 use sheetgaze::domain::style::{BorderStyle, RgbColor};
@@ -184,6 +184,7 @@ fn borders_are_read_for_values_empty_cells_and_merges() {
     assert!(merged_borders.left.is_visible());
     assert!(merged_borders.right.is_visible());
 
+    let widths = ColumnWidths::from_sheet(sheet);
     let plan = LayoutEngine::plan(
         sheet,
         &Viewport {
@@ -195,6 +196,7 @@ fn borders_are_read_for_values_empty_cells_and_merges() {
         CellAddr::new(0, 0),
         None,
         None,
+        &widths,
     );
     let row = plan
         .scroll_rows
@@ -239,7 +241,8 @@ fn merged_range_extends_used_range_and_renders_tail() {
         height: 20,
         width: 80,
     };
-    let plan = LayoutEngine::plan(sheet, &viewport, CellAddr::new(0, 0), None, None);
+    let widths = ColumnWidths::from_sheet(sheet);
+    let plan = LayoutEngine::plan(sheet, &viewport, CellAddr::new(0, 0), None, None, &widths);
     assert!(
         plan.scroll_rows.iter().any(|row| row.row == 5),
         "merged rows past the last valued cell must be planned"
@@ -268,7 +271,8 @@ fn merged_range_extends_used_range_and_renders_tail() {
     let sheet = &mut lazy.sheets[0];
     assert_eq!(sheet.meta.row_count, 6);
     sheet.ensure_rows(RowRange::new(0, 6)).unwrap();
-    let plan = LayoutEngine::plan(sheet, &viewport, CellAddr::new(0, 0), None, None);
+    let widths = ColumnWidths::from_sheet(sheet);
+    let plan = LayoutEngine::plan(sheet, &viewport, CellAddr::new(0, 0), None, None, &widths);
     let slices: Vec<_> = plan
         .scroll_rows
         .iter()
@@ -290,7 +294,8 @@ fn multi_row_merged_cells_render_all_lines() {
         height: 20,
         width: 80,
     };
-    let plan = LayoutEngine::plan(sheet, &viewport, CellAddr::new(0, 0), None, None);
+    let widths = ColumnWidths::from_sheet(sheet);
+    let plan = LayoutEngine::plan(sheet, &viewport, CellAddr::new(0, 0), None, None, &widths);
     let slices: Vec<_> = plan
         .scroll_rows
         .iter()
@@ -323,6 +328,7 @@ fn multi_row_merged_cells_render_all_lines() {
         CellAddr::new(0, 0),
         None,
         None,
+        &widths,
     );
     let scrolled_texts: Vec<String> = scrolled
         .scroll_rows
@@ -427,7 +433,8 @@ fn overflow_plan_represents_overflow_and_truncation() {
         height: 40,
         width: 200,
     };
-    let plan = LayoutEngine::plan(sheet, &viewport, CellAddr::new(0, 0), None, None);
+    let widths = ColumnWidths::from_sheet(sheet);
+    let plan = LayoutEngine::plan(sheet, &viewport, CellAddr::new(0, 0), None, None, &widths);
     let cell = |row: u32, col: u32| {
         plan.scroll_rows
             .iter()
@@ -592,7 +599,8 @@ fn excel_layout_fixture_uses_explicit_widths_and_heights() {
     assert!(sheet.layout.fixed_rows.contains(&1));
     assert!(sheet.layout.fixed_rows.contains(&2));
 
-    let wrap = LayoutEngine::measure_cell(sheet, &sheet.layout_limits, CellAddr::new(2, 1));
+    let widths = ColumnWidths::from_sheet(sheet);
+    let wrap = LayoutEngine::measure_cell(sheet, CellAddr::new(2, 1), &widths);
     assert!(
         wrap.truncated,
         "an explicit one-line row height must truncate wrapped text"

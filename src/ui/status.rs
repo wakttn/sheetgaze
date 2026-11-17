@@ -8,6 +8,12 @@ pub fn status_line(view: &ScreenView) -> String {
         status.cell_label.clone(),
         status.mode_label.clone(),
     ];
+    if status.dirty {
+        parts.push("[+]".to_string());
+    }
+    if !status.fit_label.is_empty() {
+        parts.push(status.fit_label.clone());
+    }
     if status.selection_count > 1 {
         parts.push(format!("sel:{}", status.selection_count));
     }

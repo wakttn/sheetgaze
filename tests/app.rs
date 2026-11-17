@@ -307,6 +307,89 @@ fn visual_mode_extends_to_data_rows() {
 }
 
 #[test]
+fn keymap_binds_vim_editing_keys() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use sheetgaze::app::keymap::Keymap;
+    use sheetgaze::domain::edit::{EditCommit, EditCursor};
+    use sheetgaze::domain::mode::Mode;
+
+    fn key(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+    fn ctrl(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    let mut keymap = Keymap::new();
+    assert_eq!(
+        keymap.translate(key('i'), Mode::Normal),
+        Some(Action::EditStart(EditCursor::Start))
+    );
+    assert_eq!(
+        keymap.translate(key(':'), Mode::Normal),
+        Some(Action::CommandOpen)
+    );
+    assert_eq!(
+        keymap.translate(key('K'), Mode::Normal),
+        Some(Action::OpenDetail)
+    );
+    assert_eq!(keymap.translate(key('d'), Mode::Normal), None);
+    assert_eq!(
+        keymap.translate(key('d'), Mode::Normal),
+        Some(Action::ClearRow)
+    );
+    assert_eq!(keymap.translate(key('r'), Mode::Normal), None);
+    assert_eq!(
+        keymap.translate(key('x'), Mode::Normal),
+        Some(Action::ReplaceChar('x'))
+    );
+    assert_eq!(
+        keymap.translate(ctrl('r'), Mode::Normal),
+        Some(Action::Redo)
+    );
+    assert_eq!(keymap.translate(key('u'), Mode::Normal), Some(Action::Undo));
+    assert_eq!(
+        keymap.translate(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            Mode::Insert
+        ),
+        Some(Action::EditCommit(EditCommit::Stay))
+    );
+    assert_eq!(
+        keymap.translate(ctrl('c'), Mode::Insert),
+        Some(Action::EditCancel)
+    );
+    assert_eq!(keymap.translate(key('Z'), Mode::Normal), None);
+    assert_eq!(
+        keymap.translate(key('Z'), Mode::Normal),
+        Some(Action::Save {
+            force: false,
+            quit_after: true
+        })
+    );
+}
+
+#[test]
+fn dirty_workbook_refuses_quit_without_force() {
+    let mut state = xlsx_state();
+    state.apply(Action::EditStart(
+        sheetgaze::domain::edit::EditCursor::Start,
+    ));
+    state.apply(Action::EditInput('x'));
+    state.apply(Action::EditCommit(
+        sheetgaze::domain::edit::EditCommit::Stay,
+    ));
+    assert!(state.is_dirty());
+    assert!(state.apply(Action::Quit).is_empty());
+    assert!(!state.should_quit);
+    assert!(matches!(
+        state.apply(Action::ForceQuit).as_slice(),
+        [Effect::Quit]
+    ));
+    assert!(state.should_quit);
+}
+
+#[test]
 fn detail_view_contains_cell_fields() {
     let mut state = csv_state();
     state.apply(Action::OpenDetail);

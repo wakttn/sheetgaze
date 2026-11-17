@@ -105,6 +105,12 @@ impl ReloadHandle {
         }
         let _ = self.commands.send(Command::Now);
     }
+
+    /// Updates the watcher baseline after sheetgaze itself wrote the file so
+    /// the save does not trigger an automatic reload.
+    pub fn set_baseline(&self, fingerprint: crate::domain::workbook::FileFingerprint) {
+        let _ = self.commands.send(Command::Baseline(fingerprint));
+    }
 }
 
 impl Drop for ReloadHandle {
@@ -116,6 +122,7 @@ impl Drop for ReloadHandle {
 enum Command {
     Now,
     Shutdown,
+    Baseline(crate::domain::workbook::FileFingerprint),
     Watch(WatchEvent),
 }
 
@@ -201,6 +208,9 @@ fn run_worker(
         };
         match received {
             Ok(Command::Shutdown) => break,
+            Ok(Command::Baseline(stamp)) => {
+                gate.on_loaded(stamp);
+            }
             Ok(Command::Now) => {
                 if let GateDecision::Load { reason } = gate.on_manual() {
                     let trigger = trigger_for(reason);

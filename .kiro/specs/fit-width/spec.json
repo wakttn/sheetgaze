@@ -1,0 +1,22 @@
+{
+  "feature_name": "fit-width",
+  "created_at": "2026-11-18T01:58:08+09:00",
+  "updated_at": "2026-11-18T02:42:00+09:00",
+  "language": "ja",
+  "phase": "implementation-complete",
+  "approvals": {
+    "requirements": {
+      "generated": true,
+      "approved": true
+    },
+    "design": {
+      "generated": true,
+      "approved": true
+    },
+    "tasks": {
+      "generated": true,
+      "approved": true
+    }
+  },
+  "ready_for_implementation": true
+}

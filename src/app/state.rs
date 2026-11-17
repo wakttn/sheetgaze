@@ -1,23 +1,29 @@
 use crate::app::action::{Action, Effect, Motion};
 use crate::app::reload::{ReloadSummary, ReloadTrigger};
 use crate::config::Config;
-use crate::domain::addr::CellAddr;
-use crate::domain::cell::{CellRead, EffectiveCell};
+use crate::domain::addr::{CellAddr, CellRange};
+use crate::domain::cell::{Cell, CellRead, CellValue};
+use crate::domain::command::{self, ExCommand, SubstituteCommand, SubstituteScope};
 use crate::domain::copy::{CopyEncoder, CopyLimits};
+use crate::domain::edit::{
+    self, EditChange, EditCursor, EditLog, EditTransaction, InputKind, InputState,
+};
 use crate::domain::filter::{FilterSource, FilterState};
-use crate::domain::formula::{FormulaOverlay, FormulaResults, FormulaStatus};
-use crate::domain::layout::{LayoutEngine, RenderPlan, Viewport};
+use crate::domain::formula::FormulaResults;
+use crate::domain::jump::{JumpEntry, JumpList};
+use crate::domain::layout::{ColumnWidths, LayoutEngine, RenderPlan, Viewport};
 use crate::domain::mode::Mode;
 use crate::domain::reload::WatchMode;
 use crate::domain::row_store::RowRange;
 use crate::domain::search::{MatchSource, SearchIndex, SearchMatch, SearchQuery};
 use crate::domain::selection::Selection;
-use crate::domain::sheet::{Sheet, SheetData};
+use crate::domain::sheet::Sheet;
+use crate::domain::task::Generation;
 use crate::domain::viewport::ViewportPlanner;
-use crate::domain::workbook::WorkbookModel;
+use crate::domain::workbook::{SourceFormat, WorkbookModel};
 use crate::ui::view::{
-    DetailView, FilterPanelView, HelpView, ScreenView, SearchHighlight, SearchPromptView,
-    StatusView,
+    DetailView, FilterPanelView, HelpView, InputLineView, ScreenView, SearchHighlight,
+    SearchPromptView, StatusView,
 };
 
 pub struct AppState {
@@ -25,10 +31,12 @@ pub struct AppState {
     pub focus: CellAddr,
     pub selection: Option<Selection>,
     pub mode: Mode,
+    pub fit_width: bool,
     pub viewport: Viewport,
     pub detail_scroll: usize,
     pub search_query: String,
     pub search_index: Option<SearchIndex>,
+    pub last_search: Option<SearchQuery>,
     pub status_message: Option<String>,
     pub config: Config,
     pub should_quit: bool,
@@ -36,6 +44,13 @@ pub struct AppState {
     pub selected_filter: usize,
     pub watch_configured: WatchMode,
     pub watch_effective: WatchMode,
+    pub edit_log: EditLog,
+    pub input: Option<InputState>,
+    pub command_history: Vec<String>,
+    pub command_history_index: Option<usize>,
+    pub jump_list: JumpList,
+    pub pending_recalc: bool,
+    pub read_only: bool,
 }
 
 impl AppState {
@@ -43,11 +58,17 @@ impl AppState {
         let active = workbook.active_sheet;
         let focus = CellAddr::new(0, 0);
         let watch_mode = config.watch.mode;
+        let read_only = config.cli.read_only
+            || workbook.source.format != SourceFormat::Xlsx
+            || std::fs::metadata(&workbook.source.path)
+                .map(|meta| meta.permissions().readonly())
+                .unwrap_or(false);
         Self {
             workbook: Some(workbook),
             focus,
             selection: None,
             mode: Mode::Normal,
+            fit_width: config.cli.fit_width,
             viewport: Viewport {
                 top_visible_row: 0,
                 left_col: 0,
@@ -57,6 +78,7 @@ impl AppState {
             detail_scroll: 0,
             search_query: String::new(),
             search_index: None,
+            last_search: None,
             status_message: None,
             config,
             should_quit: false,
@@ -64,6 +86,13 @@ impl AppState {
             selected_filter: 0,
             watch_configured: watch_mode,
             watch_effective: watch_mode,
+            edit_log: EditLog::new(),
+            input: None,
+            command_history: Vec::new(),
+            command_history_index: None,
+            jump_list: JumpList::new(),
+            pending_recalc: false,
+            read_only,
         }
         .with_sheet(active)
         .with_focus(focus)
@@ -190,6 +219,24 @@ impl AppState {
         let max_filter = self.filter_line_count().saturating_sub(1);
         self.selected_filter = self.selected_filter.min(max_filter);
         self.search_index = None;
+        let edits_discarded = self.edit_log.is_dirty();
+        self.edit_log.clear();
+        self.jump_list.clear();
+        self.input = None;
+        self.pending_recalc = false;
+        if matches!(self.mode, Mode::Insert | Mode::Command) {
+            self.mode = Mode::Normal;
+        }
+        self.read_only = self.config.cli.read_only
+            || self
+                .workbook
+                .as_ref()
+                .is_some_and(|workbook| workbook.source.format != SourceFormat::Xlsx)
+            || self
+                .workbook
+                .as_ref()
+                .and_then(|workbook| std::fs::metadata(&workbook.source.path).ok())
+                .is_some_and(|meta| meta.permissions().readonly());
         self.ensure_focus_visible();
 
         let summary = ReloadSummary {
@@ -207,6 +254,9 @@ impl AppState {
         }
         if search_cleared {
             message.push_str("; search results cleared");
+        }
+        if edits_discarded {
+            message.push_str("; unsaved edits discarded");
         }
         self.status_message = Some(message);
         summary
@@ -236,6 +286,161 @@ impl AppState {
 
     pub fn apply(&mut self, action: Action) -> Vec<Effect> {
         match action {
+            Action::EditStart(cursor) => {
+                self.start_edit(cursor, None);
+                Vec::new()
+            }
+            Action::EditClear => {
+                self.start_edit(EditCursor::Start, Some(String::new()));
+                Vec::new()
+            }
+            Action::EditFormula => {
+                self.start_edit(EditCursor::End, Some("=".to_string()));
+                Vec::new()
+            }
+            Action::EditInput(ch) => {
+                if let Some(input) = &mut self.input {
+                    input.insert(ch);
+                }
+                Vec::new()
+            }
+            Action::EditBackspace => {
+                if let Some(input) = &mut self.input {
+                    input.backspace();
+                }
+                Vec::new()
+            }
+            Action::EditDelete => {
+                if let Some(input) = &mut self.input {
+                    input.delete();
+                }
+                Vec::new()
+            }
+            Action::EditLeft => {
+                if let Some(input) = &mut self.input {
+                    input.left();
+                }
+                Vec::new()
+            }
+            Action::EditRight => {
+                if let Some(input) = &mut self.input {
+                    input.right();
+                }
+                Vec::new()
+            }
+            Action::EditHome => {
+                if let Some(input) = &mut self.input {
+                    input.home();
+                }
+                Vec::new()
+            }
+            Action::EditEnd => {
+                if let Some(input) = &mut self.input {
+                    input.end();
+                }
+                Vec::new()
+            }
+            Action::EditDeleteWord => {
+                if let Some(input) = &mut self.input {
+                    input.delete_word();
+                }
+                Vec::new()
+            }
+            Action::EditDeleteToStart => {
+                if let Some(input) = &mut self.input {
+                    input.delete_to_start();
+                }
+                Vec::new()
+            }
+            Action::EditCommit(direction) => {
+                self.commit_edit(direction);
+                Vec::new()
+            }
+            Action::EditCancel => {
+                self.cancel_edit();
+                Vec::new()
+            }
+            Action::CommandOpen => {
+                self.open_command();
+                Vec::new()
+            }
+            Action::CommandInput(ch) => {
+                if let Some(input) = &mut self.input {
+                    input.insert(ch);
+                }
+                Vec::new()
+            }
+            Action::CommandBackspace => {
+                if let Some(input) = &mut self.input {
+                    input.backspace();
+                }
+                Vec::new()
+            }
+            Action::CommandHistory(delta) => {
+                self.command_history(delta);
+                Vec::new()
+            }
+            Action::CommandSubmit => self.submit_command(),
+            Action::CommandCancel => {
+                self.input = None;
+                self.mode = Mode::Normal;
+                Vec::new()
+            }
+            Action::Undo => {
+                self.undo();
+                Vec::new()
+            }
+            Action::Redo => {
+                self.redo();
+                Vec::new()
+            }
+            Action::ClearCell => {
+                self.clear_cell_or_selection();
+                Vec::new()
+            }
+            Action::ClearRow => {
+                self.clear_row();
+                Vec::new()
+            }
+            Action::ClearMotion(motion) => {
+                self.clear_motion(motion);
+                Vec::new()
+            }
+            Action::ReplaceChar(ch) => {
+                self.replace_char(ch);
+                Vec::new()
+            }
+            Action::SearchWord(forward) => {
+                self.search_word(forward);
+                Vec::new()
+            }
+            Action::JumpBack => {
+                if let Some(entry) = self.jump_list.back() {
+                    self.jump_to_without_history(entry.sheet, entry.addr);
+                }
+                Vec::new()
+            }
+            Action::JumpForward => {
+                if let Some(entry) = self.jump_list.forward() {
+                    self.jump_to_without_history(entry.sheet, entry.addr);
+                }
+                Vec::new()
+            }
+            Action::Save { force, quit_after } => {
+                if self.edit_log.is_dirty() {
+                    vec![Effect::Save { force, quit_after }]
+                } else if quit_after {
+                    self.should_quit = true;
+                    vec![Effect::Quit]
+                } else {
+                    self.status_message = Some("no changes to write".to_string());
+                    Vec::new()
+                }
+            }
+            Action::ForceQuit => {
+                self.should_quit = true;
+                vec![Effect::Quit]
+            }
             Action::Move(motion) => {
                 self.move_focus(motion, false);
                 Vec::new()
@@ -259,8 +464,22 @@ impl AppState {
                 self.mode = Mode::Visual;
                 Vec::new()
             }
+            Action::ToggleFitWidth => {
+                self.fit_width = !self.fit_width;
+                if self.fit_width {
+                    self.viewport.left_col = 0;
+                }
+                self.ensure_focus_visible();
+                Vec::new()
+            }
             Action::Copy => match self.copy_payload() {
-                Ok(payload) => vec![Effect::WriteClipboard(payload.text)],
+                Ok(payload) => {
+                    if self.mode == Mode::Visual {
+                        self.selection = None;
+                        self.mode = Mode::Normal;
+                    }
+                    vec![Effect::WriteClipboard(payload.text)]
+                }
                 Err(message) => {
                     self.status_message = Some(message);
                     Vec::new()
@@ -360,6 +579,17 @@ impl AppState {
                 Vec::new()
             }
             Action::Reload => {
+                if self.edit_log.is_dirty() {
+                    self.status_message =
+                        Some("unsaved changes; use :e! to discard or :w to write".to_string());
+                    Vec::new()
+                } else {
+                    self.status_message = Some("reloading (manual)...".to_string());
+                    vec![Effect::Reload]
+                }
+            }
+            Action::ReloadForce => {
+                self.input = None;
                 self.status_message = Some("reloading (manual)...".to_string());
                 vec![Effect::Reload]
             }
@@ -377,10 +607,710 @@ impl AppState {
                 Vec::new()
             }
             Action::Quit => {
-                self.should_quit = true;
-                vec![Effect::Quit]
+                if self.edit_log.is_dirty() {
+                    self.status_message =
+                        Some("unsaved changes; use :wq, :q!, or ZQ to discard".to_string());
+                    Vec::new()
+                } else {
+                    self.should_quit = true;
+                    vec![Effect::Quit]
+                }
             }
         }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.edit_log.is_dirty()
+    }
+
+    pub fn editing_enabled(&self) -> bool {
+        !self.read_only
+    }
+
+    fn editing_allowed(&self) -> bool {
+        !self.read_only
+            && self
+                .workbook
+                .as_ref()
+                .is_some_and(|workbook| workbook.source.format == SourceFormat::Xlsx)
+    }
+
+    fn start_edit(&mut self, cursor: EditCursor, initial: Option<String>) {
+        if !self.editing_allowed() {
+            self.status_message = Some(if self.read_only {
+                "read-only workbook".to_string()
+            } else {
+                "editing is supported for xlsx only".to_string()
+            });
+            return;
+        }
+        self.ensure_focus_loaded();
+        let Some(sheet) = self.active_sheet() else {
+            return;
+        };
+        let sheet_index = self.active_sheet_index();
+        let addr = sheet.merges.anchor_for(self.focus);
+        let cell = sheet.raw_cell(addr).cloned();
+        let original = cell
+            .as_ref()
+            .map(edit::input_text_for_cell)
+            .unwrap_or_default();
+        let text = initial.unwrap_or_else(|| original.clone());
+        let mut input = InputState::cell(sheet_index, addr, original, cursor);
+        input.set_text(&text);
+        input.cursor = match cursor {
+            EditCursor::Start => 0,
+            EditCursor::End => input.chars.len(),
+        };
+        self.input = Some(input);
+        self.mode = Mode::Insert;
+    }
+
+    fn cancel_edit(&mut self) {
+        self.input = None;
+        self.mode = Mode::Normal;
+    }
+
+    fn commit_edit(&mut self, direction: crate::domain::edit::EditCommit) {
+        let Some(input) = self.input.take() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        self.mode = Mode::Normal;
+        let InputKind::Cell { sheet, addr } = input.kind else {
+            return;
+        };
+        let text = input.text();
+        if text != input.original {
+            self.apply_cell_text(sheet, addr, &text);
+        }
+        match direction {
+            crate::domain::edit::EditCommit::Down => self.move_focus(Motion::Down, false),
+            crate::domain::edit::EditCommit::Right => self.move_focus(Motion::Right, false),
+            crate::domain::edit::EditCommit::Left => self.move_focus(Motion::Left, false),
+            crate::domain::edit::EditCommit::Stay => {}
+        }
+    }
+
+    fn apply_cell_text(&mut self, sheet_index: usize, addr: CellAddr, text: &str) {
+        if !self.editing_allowed() {
+            return;
+        }
+        let Some(workbook) = &mut self.workbook else {
+            return;
+        };
+        let Some(sheet) = workbook.sheets.get_mut(sheet_index) else {
+            return;
+        };
+        let addr = sheet.merges.anchor_for(addr);
+        let before = sheet.raw_cell(addr).cloned();
+        let style = before.as_ref().map(|cell| cell.style).unwrap_or_default();
+        let number_format = before.as_ref().and_then(|cell| cell.number_format.clone());
+        let after = edit::parse_cell_input(text, style, number_format);
+        sheet.set_edit_cell(addr, Some(after.clone()));
+        self.edit_log
+            .record(EditTransaction::single(EditChange::new(
+                sheet_index,
+                addr,
+                before,
+                Some(after),
+            )));
+        self.after_edit(&[sheet_index]);
+        self.status_message = Some(format!("edited {}", addr.a1()));
+    }
+
+    fn after_edit(&mut self, sheets: &[usize]) {
+        if let Some(workbook) = &mut self.workbook {
+            workbook.generation = Generation(workbook.generation.0.saturating_add(1));
+        }
+        for &index in sheets {
+            if let Some(sheet) = self
+                .workbook
+                .as_mut()
+                .and_then(|workbook| workbook.sheets.get_mut(index))
+            {
+                let _ = sheet.rebuild_visibility();
+            }
+        }
+        self.rebuild_visibility();
+        self.search_index = None;
+        self.pending_recalc = self.has_formulas();
+        self.ensure_focus_loaded();
+        self.ensure_focus_visible();
+    }
+
+    fn has_formulas(&self) -> bool {
+        self.workbook.as_ref().is_some_and(|workbook| {
+            workbook
+                .sheets
+                .iter()
+                .any(|sheet| !sheet.formula_cells.is_empty())
+        })
+    }
+
+    fn undo(&mut self) {
+        let Some(workbook) = &mut self.workbook else {
+            return;
+        };
+        let Some(transaction) = self.edit_log.undo(workbook) else {
+            self.status_message = Some("already at the oldest change".to_string());
+            return;
+        };
+        let sheets: Vec<usize> = transaction
+            .changes
+            .iter()
+            .map(|change| change.sheet)
+            .collect();
+        for &index in &sheets {
+            if let Some(sheet) = workbook.sheets.get_mut(index) {
+                let _ = sheet.rebuild_visibility();
+            }
+        }
+        self.rebuild_visibility();
+        self.search_index = None;
+        self.pending_recalc = self.has_formulas();
+        self.ensure_focus_loaded();
+        self.ensure_focus_visible();
+        self.status_message = Some(format!("undo: {} cells", transaction.cell_count()));
+    }
+
+    fn redo(&mut self) {
+        let Some(workbook) = &mut self.workbook else {
+            return;
+        };
+        let Some(transaction) = self.edit_log.redo(workbook) else {
+            self.status_message = Some("already at the newest change".to_string());
+            return;
+        };
+        let sheets: Vec<usize> = transaction
+            .changes
+            .iter()
+            .map(|change| change.sheet)
+            .collect();
+        for &index in &sheets {
+            if let Some(sheet) = workbook.sheets.get_mut(index) {
+                let _ = sheet.rebuild_visibility();
+            }
+        }
+        self.rebuild_visibility();
+        self.search_index = None;
+        self.pending_recalc = self.has_formulas();
+        self.ensure_focus_loaded();
+        self.ensure_focus_visible();
+        self.status_message = Some(format!("redo: {} cells", transaction.cell_count()));
+    }
+
+    fn open_command(&mut self) {
+        let mut input = InputState::command();
+        if self.selection.is_some() {
+            input.set_text("'<,'>");
+        }
+        self.input = Some(input);
+        self.command_history_index = None;
+        self.mode = Mode::Command;
+    }
+
+    fn command_history(&mut self, delta: i32) {
+        if self.command_history.is_empty() {
+            return;
+        }
+        let len = self.command_history.len();
+        let current = self.command_history_index.unwrap_or(len);
+        let next = if delta > 0 {
+            current.saturating_sub(1)
+        } else {
+            (current + 1).min(len)
+        };
+        self.command_history_index = if next == len { None } else { Some(next) };
+        if let Some(input) = &mut self.input {
+            if let Some(index) = self.command_history_index {
+                input.set_text(&self.command_history[index].clone());
+            } else {
+                input.set_text("");
+            }
+        }
+    }
+
+    fn submit_command(&mut self) -> Vec<Effect> {
+        let Some(input) = self.input.take() else {
+            self.mode = Mode::Normal;
+            return Vec::new();
+        };
+        let text = input.text();
+        if !text.trim().is_empty() && self.command_history.last() != Some(&text) {
+            self.command_history.push(text.clone());
+        }
+        self.command_history_index = None;
+        self.mode = Mode::Normal;
+        match command::parse(&text) {
+            Ok(command) => match self.execute_command(command) {
+                Ok(effects) => effects,
+                Err(message) => {
+                    self.status_message = Some(message);
+                    Vec::new()
+                }
+            },
+            Err(message) => {
+                self.status_message = Some(message);
+                Vec::new()
+            }
+        }
+    }
+
+    fn execute_command(&mut self, command: ExCommand) -> Result<Vec<Effect>, String> {
+        match command {
+            ExCommand::Noop => Ok(Vec::new()),
+            ExCommand::Write { force, path } => {
+                if path.is_some() {
+                    return Err("save-as is not supported yet".to_string());
+                }
+                Ok(vec![Effect::Save {
+                    force,
+                    quit_after: false,
+                }])
+            }
+            ExCommand::Quit { force } => {
+                if self.edit_log.is_dirty() && !force {
+                    return Err("unsaved changes; use :q! to discard".to_string());
+                }
+                self.should_quit = true;
+                Ok(vec![Effect::Quit])
+            }
+            ExCommand::WriteQuit { force } => {
+                if !self.edit_log.is_dirty() {
+                    self.should_quit = true;
+                    return Ok(vec![Effect::Quit]);
+                }
+                Ok(vec![Effect::Save {
+                    force,
+                    quit_after: true,
+                }])
+            }
+            ExCommand::Edit { force } => {
+                if self.edit_log.is_dirty() && !force {
+                    return Err("unsaved changes; use :e! to discard".to_string());
+                }
+                self.input = None;
+                self.status_message = Some("reloading (manual)...".to_string());
+                Ok(vec![Effect::Reload])
+            }
+            ExCommand::Substitute(substitute) => {
+                self.apply_substitute(&substitute)?;
+                Ok(Vec::new())
+            }
+            ExCommand::Goto { sheet, addr } => {
+                self.goto_command(sheet, addr)?;
+                Ok(Vec::new())
+            }
+            ExCommand::Sheet(name) => {
+                let Some(workbook) = &self.workbook else {
+                    return Err("no workbook".to_string());
+                };
+                let Some(index) = workbook.sheets.iter().position(|sheet| sheet.name == name)
+                else {
+                    return Err(format!("unknown sheet: {name}"));
+                };
+                self.activate_sheet(index);
+                self.status_message = Some(format!("sheet: {name}"));
+                Ok(Vec::new())
+            }
+            ExCommand::Help => {
+                self.mode = Mode::Help;
+                Ok(Vec::new())
+            }
+            ExCommand::Unknown(command) => Err(format!("unknown command: :{command}")),
+        }
+    }
+
+    fn clear_cell_or_selection(&mut self) {
+        if !self.editing_allowed() {
+            self.status_message = Some("editing is not available".to_string());
+            return;
+        }
+        let Some(sheet) = self.active_sheet() else {
+            return;
+        };
+        let range = self.selection.map_or_else(
+            || CellRange::single(self.focus),
+            |selection| selection.range(sheet.used_range.end.col + 1),
+        );
+        let sheet_index = self.active_sheet_index();
+        if self.selection.is_some() {
+            self.selection = None;
+            self.mode = Mode::Normal;
+        }
+        match self.clear_range(sheet_index, range) {
+            Ok(0) => self.status_message = Some("nothing to clear".to_string()),
+            Ok(count) => self.status_message = Some(format!("cleared {count} cells")),
+            Err(message) => self.status_message = Some(message),
+        }
+    }
+
+    fn clear_row(&mut self) {
+        if !self.editing_allowed() {
+            self.status_message = Some("editing is not available".to_string());
+            return;
+        }
+        let Some(sheet) = self.active_sheet() else {
+            return;
+        };
+        let row = self.focus.row;
+        let range = CellRange::new(
+            CellAddr::new(row, 0),
+            CellAddr::new(row, sheet.used_range.end.col),
+        );
+        let sheet_index = self.active_sheet_index();
+        match self.clear_range(sheet_index, range) {
+            Ok(0) => self.status_message = Some("nothing to clear".to_string()),
+            Ok(count) => {
+                self.status_message = Some(format!("cleared row {} ({count} cells)", row + 1))
+            }
+            Err(message) => self.status_message = Some(message),
+        }
+    }
+
+    fn clear_motion(&mut self, motion: Motion) {
+        if matches!(motion, Motion::FirstNonBlank) {
+            self.ensure_focus_loaded();
+        }
+        let Some(target) = self.motion_target(motion) else {
+            return;
+        };
+        let sheet_index = self.active_sheet_index();
+        let range = CellRange::new(self.focus, target);
+        match self.clear_range(sheet_index, range) {
+            Ok(0) => self.status_message = Some("nothing to clear".to_string()),
+            Ok(count) => self.status_message = Some(format!("cleared {count} cells")),
+            Err(message) => self.status_message = Some(message),
+        }
+    }
+
+    fn clear_range(&mut self, sheet_index: usize, range: CellRange) -> Result<usize, String> {
+        if !self.editing_allowed() {
+            return Err("editing is not available".to_string());
+        }
+        let Some(workbook) = &mut self.workbook else {
+            return Err("no workbook".to_string());
+        };
+        let Some(sheet) = workbook.sheets.get_mut(sheet_index) else {
+            return Err("no sheet".to_string());
+        };
+        let cells = sheet
+            .collect_cells(range, true)
+            .map_err(|error| error.to_string())?;
+        let mut changes = Vec::new();
+        for (addr, cell) in cells {
+            if sheet.merges.anchor_for(addr) != addr {
+                continue;
+            }
+            if cell.raw.is_empty() && cell.formula.is_none() {
+                continue;
+            }
+            let after =
+                Cell::new_with_format(CellValue::Empty, cell.style, cell.number_format.clone());
+            sheet.set_edit_cell(addr, Some(after.clone()));
+            changes.push(EditChange::new(sheet_index, addr, Some(cell), Some(after)));
+        }
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        let count = changes.len();
+        self.edit_log.record(EditTransaction { changes });
+        self.after_edit(&[sheet_index]);
+        Ok(count)
+    }
+
+    fn replace_char(&mut self, ch: char) {
+        if !self.editing_allowed() {
+            self.status_message = Some("editing is not available".to_string());
+            return;
+        }
+        let Some(sheet) = self.active_sheet() else {
+            return;
+        };
+        let range = self.selection.map_or_else(
+            || CellRange::single(self.focus),
+            |selection| selection.range(sheet.used_range.end.col + 1),
+        );
+        let sheet_index = self.active_sheet_index();
+        let Some(workbook) = &mut self.workbook else {
+            return;
+        };
+        let Some(sheet) = workbook.sheets.get_mut(sheet_index) else {
+            return;
+        };
+        let mut changes = Vec::new();
+        for row in range.rows() {
+            let _ = sheet.ensure_rows(RowRange::new(row, row.saturating_add(1)));
+            for col in range.cols() {
+                let addr = CellAddr::new(row, col);
+                if sheet.merges.anchor_for(addr) != addr {
+                    continue;
+                }
+                let before = sheet.raw_cell(addr).cloned();
+                let style = before.as_ref().map(|cell| cell.style).unwrap_or_default();
+                let number_format = before.as_ref().and_then(|cell| cell.number_format.clone());
+                let after = edit::parse_cell_input(&ch.to_string(), style, number_format);
+                sheet.set_edit_cell(addr, Some(after.clone()));
+                changes.push(EditChange::new(sheet_index, addr, before, Some(after)));
+            }
+        }
+        if changes.is_empty() {
+            return;
+        }
+        let count = changes.len();
+        self.edit_log.record(EditTransaction { changes });
+        self.selection = None;
+        self.mode = Mode::Normal;
+        self.after_edit(&[sheet_index]);
+        self.status_message = Some(format!("replaced {count} cells"));
+    }
+
+    fn search_word(&mut self, forward: bool) {
+        self.ensure_focus_loaded();
+        let origin_sheet = self.active_sheet_index();
+        let origin = self.focus;
+        let Some(sheet) = self.active_sheet() else {
+            return;
+        };
+        let text = match sheet.read_cell(self.focus) {
+            CellRead::Loaded(cell) => cell.display.trim().to_string(),
+            _ => String::new(),
+        };
+        if text.is_empty() {
+            self.status_message = Some("current cell is empty".to_string());
+            return;
+        }
+        self.search_query = text.clone();
+        let query = SearchQuery::new(text);
+        self.last_search = Some(query.clone());
+        let Some(mut index) = self.build_search_index(query) else {
+            return;
+        };
+        let visibilities: Vec<_> = self
+            .workbook
+            .as_ref()
+            .map(|workbook| {
+                workbook
+                    .sheets
+                    .iter()
+                    .map(|sheet| sheet.visibility.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let total = index.matches.len();
+        let matched = index.select_visible_from(origin_sheet, origin, forward, &visibilities);
+        self.search_index = Some(index);
+        if let Some(matched) = matched {
+            self.jump_to(matched.sheet, matched.addr);
+        } else if total > 0 {
+            self.status_message = Some("no visible match".to_string());
+        } else {
+            self.status_message = Some("no match".to_string());
+        }
+    }
+
+    fn goto_command(
+        &mut self,
+        sheet: Option<String>,
+        addr: Option<CellAddr>,
+    ) -> Result<(), String> {
+        let Some(workbook) = &self.workbook else {
+            return Err("no workbook".to_string());
+        };
+        let sheet_index = match sheet {
+            Some(name) => workbook
+                .sheets
+                .iter()
+                .position(|sheet| sheet.name == name)
+                .ok_or_else(|| format!("unknown sheet: {name}"))?,
+            None => workbook.active_sheet,
+        };
+        let addr = addr.unwrap_or_default();
+        self.jump_to(sheet_index, addr);
+        Ok(())
+    }
+
+    fn jump_to(&mut self, sheet: usize, addr: CellAddr) {
+        if sheet == self.active_sheet_index() && addr == self.focus {
+            return;
+        }
+        self.jump_list.push(JumpEntry {
+            sheet: self.active_sheet_index(),
+            addr: self.focus,
+        });
+        self.jump_to_without_history(sheet, addr);
+        self.jump_list.push(JumpEntry {
+            sheet: self.active_sheet_index(),
+            addr: self.focus,
+        });
+    }
+
+    fn jump_to_without_history(&mut self, sheet: usize, addr: CellAddr) {
+        let Some(workbook) = &mut self.workbook else {
+            return;
+        };
+        if sheet >= workbook.sheets.len() {
+            return;
+        }
+        let changed_sheet = workbook.active_sheet != sheet;
+        workbook.active_sheet = sheet;
+        let anchor = workbook
+            .sheets
+            .get(sheet)
+            .map(|sheet| sheet.merges.anchor_for(addr))
+            .unwrap_or(addr);
+        self.focus = anchor;
+        self.selection = None;
+        self.mode = Mode::Normal;
+        if changed_sheet {
+            self.viewport.top_visible_row = 0;
+            self.viewport.left_col = 0;
+        }
+        if let Some(index) = &mut self.search_index {
+            index.set_active_sheet(sheet);
+        }
+        self.ensure_focus_loaded();
+        self.rebuild_visibility();
+        self.ensure_focus_visible();
+    }
+
+    fn activate_sheet(&mut self, index: usize) {
+        self.jump_to(index, CellAddr::new(0, 0));
+    }
+
+    fn apply_substitute(&mut self, command: &SubstituteCommand) -> Result<(), String> {
+        if !self.editing_allowed() {
+            return Err("editing is not available".to_string());
+        }
+        let pattern = if command.pattern.is_empty() {
+            self.last_search
+                .as_ref()
+                .map(|query| query.text.clone())
+                .ok_or_else(|| "no previous search pattern".to_string())?
+        } else {
+            command.pattern.clone()
+        };
+        let case_sensitive = command
+            .case_sensitive
+            .unwrap_or_else(|| pattern.chars().any(|ch| ch.is_uppercase()));
+        let Some(workbook) = &mut self.workbook else {
+            return Err("no workbook".to_string());
+        };
+        let active_sheet = workbook.active_sheet;
+        let mut targets: Vec<(usize, CellRange)> = Vec::new();
+        match &command.scope {
+            SubstituteScope::CurrentCell => {
+                targets.push((active_sheet, CellRange::single(self.focus)));
+            }
+            SubstituteScope::Selection => {
+                let selection = self
+                    .selection
+                    .ok_or_else(|| "no visual selection".to_string())?;
+                let sheet = workbook
+                    .sheets
+                    .get(active_sheet)
+                    .ok_or_else(|| "no sheet".to_string())?;
+                targets.push((active_sheet, selection.range(sheet.used_range.end.col + 1)));
+            }
+            SubstituteScope::Range(range) => {
+                targets.push((active_sheet, *range));
+            }
+            SubstituteScope::Sheet => {
+                let sheet = workbook
+                    .sheets
+                    .get(active_sheet)
+                    .ok_or_else(|| "no sheet".to_string())?;
+                targets.push((
+                    active_sheet,
+                    CellRange::new(CellAddr::new(0, 0), sheet.used_range.end),
+                ));
+            }
+            SubstituteScope::Workbook => {
+                for (index, sheet) in workbook.sheets.iter().enumerate() {
+                    targets.push((
+                        index,
+                        CellRange::new(CellAddr::new(0, 0), sheet.used_range.end),
+                    ));
+                }
+            }
+        }
+
+        let mut changes = Vec::new();
+        let mut cells_changed = 0usize;
+        let mut occurrences = 0usize;
+        let mut skipped_formulas = 0usize;
+        for (sheet_index, range) in targets {
+            let Some(sheet) = workbook.sheets.get_mut(sheet_index) else {
+                continue;
+            };
+            let cells = sheet
+                .collect_cells(range, true)
+                .map_err(|error| error.to_string())?;
+            for (addr, cell) in cells {
+                if sheet.merges.anchor_for(addr) != addr {
+                    continue;
+                }
+                if cell.formula.is_some() {
+                    if edit::replace_literal(
+                        &cell.display,
+                        &pattern,
+                        &command.replacement,
+                        command.global,
+                        case_sensitive,
+                    )
+                    .1 > 0
+                    {
+                        skipped_formulas += 1;
+                    }
+                    continue;
+                }
+                let (new_text, count) = edit::replace_literal(
+                    &cell.display,
+                    &pattern,
+                    &command.replacement,
+                    command.global,
+                    case_sensitive,
+                );
+                if count == 0 {
+                    continue;
+                }
+                occurrences += count;
+                if command.count_only {
+                    cells_changed += 1;
+                    continue;
+                }
+                let after = edit::cell_from_replacement(&cell, &new_text);
+                sheet.set_edit_cell(addr, Some(after.clone()));
+                changes.push(EditChange::new(sheet_index, addr, Some(cell), Some(after)));
+                cells_changed += 1;
+            }
+        }
+
+        if command.count_only {
+            self.status_message = Some(format!(
+                "would replace {occurrences} occurrences in {cells_changed} cells; formulas skipped: {skipped_formulas}"
+            ));
+            return Ok(());
+        }
+        if changes.is_empty() {
+            self.status_message = Some(format!("no matches; formulas skipped: {skipped_formulas}"));
+            return Ok(());
+        }
+        let sheets: Vec<usize> = {
+            let mut sheets: Vec<usize> = changes.iter().map(|change| change.sheet).collect();
+            sheets.sort_unstable();
+            sheets.dedup();
+            sheets
+        };
+        self.edit_log.record(EditTransaction { changes });
+        self.selection = None;
+        self.mode = Mode::Normal;
+        self.after_edit(&sheets);
+        self.status_message = Some(format!(
+            "replaced {occurrences} occurrences in {cells_changed} cells; formulas skipped: {skipped_formulas}"
+        ));
+        Ok(())
     }
 
     pub fn apply_formula_results(&mut self, results: FormulaResults) {
@@ -420,6 +1350,14 @@ impl AppState {
             .unwrap_or(0)
     }
 
+    pub fn column_widths(&self, sheet: &Sheet) -> ColumnWidths {
+        if self.fit_width {
+            ColumnWidths::fit(sheet, self.viewport.width)
+        } else {
+            ColumnWidths::from_sheet(sheet)
+        }
+    }
+
     fn switch_sheet(&mut self, delta: i32) {
         let Some(workbook) = &mut self.workbook else {
             return;
@@ -432,7 +1370,9 @@ impl AppState {
         workbook.active_sheet = next as usize;
         self.focus = CellAddr::new(0, 0);
         self.selection = None;
-        self.search_index = None;
+        if let Some(index) = &mut self.search_index {
+            index.set_active_sheet(next as usize);
+        }
         self.viewport.top_visible_row = 0;
         self.viewport.left_col = 0;
         self.rebuild_visibility();
@@ -443,9 +1383,25 @@ impl AppState {
         if matches!(motion, Motion::FirstNonBlank) {
             self.ensure_focus_loaded();
         }
-        let Some(sheet) = self.active_sheet() else {
+        let Some(target) = self.motion_target(motion) else {
             return;
         };
+        self.focus = target;
+        if extend {
+            if let Some(selection) = &mut self.selection {
+                selection.extend(target);
+            } else {
+                self.selection = Some(Selection::new(target));
+                self.mode = Mode::Visual;
+            }
+        }
+        self.ensure_focus_visible();
+    }
+
+    /// Computes the destination of a motion without mutating navigation state.
+    /// Used both by focus movement and by delete/change operators.
+    fn motion_target(&self, motion: Motion) -> Option<CellAddr> {
+        let sheet = self.active_sheet()?;
         let current = self.focus;
         let mut row = current.row;
         let mut col = current.col;
@@ -468,8 +1424,6 @@ impl AppState {
         }
         row = row.min(sheet.used_range.end.row);
         col = col.min(sheet.used_range.end.col);
-        // Absolute jumps already resolve any merge at the target below.
-        // Escaping from the current merge is only meaningful for relative moves.
         let absolute_jump = matches!(
             motion,
             Motion::DataTop | Motion::DataBottom | Motion::FirstNonBlank
@@ -486,9 +1440,6 @@ impl AppState {
                 }
                 Motion::DataTop | Motion::DataBottom | Motion::FirstNonBlank => {}
             }
-            // Moving past a merge that touches the edge of the used range must
-            // not place the cursor outside the rendered grid. Otherwise the
-            // focus cell disappears and no highlight is shown.
             row = row.min(sheet.used_range.end.row);
             col = col.min(sheet.used_range.end.col);
         }
@@ -515,24 +1466,17 @@ impl AppState {
             .unwrap_or(anchor.row);
             CellAddr::new(next, anchor.col)
         };
-        self.focus = target;
-        if extend {
-            if let Some(selection) = &mut self.selection {
-                selection.extend(target);
-            } else {
-                self.selection = Some(Selection::new(target));
-                self.mode = Mode::Visual;
-            }
-        }
-        self.ensure_focus_visible();
+        Some(target)
     }
 
     fn ensure_focus_visible(&mut self) {
         let Some(sheet) = self.active_sheet() else {
             return;
         };
-        let freeze = LayoutEngine::effective_freeze(sheet, &self.viewport);
-        let plan = ViewportPlanner::ensure_visible(sheet, &self.viewport, self.focus, freeze);
+        let widths = self.column_widths(sheet);
+        let freeze = LayoutEngine::effective_freeze(sheet, &self.viewport, &widths);
+        let plan =
+            ViewportPlanner::ensure_visible(sheet, &self.viewport, self.focus, freeze, &widths);
         self.viewport.top_visible_row = plan.top_visible_row;
         self.viewport.left_col = plan.left_col;
     }
@@ -573,85 +1517,23 @@ impl AppState {
         let text = self.search_query.trim().to_string();
         if text.is_empty() {
             self.search_index = None;
+            self.last_search = None;
             return;
         }
         let query = SearchQuery::new(text);
-        let mut matches = Vec::new();
-        if let Some(sheet) = self.active_sheet_mut() {
-            match &mut sheet.data {
-                SheetData::Eager(cells) => {
-                    let overlay = sheet.formula_overlay.clone();
-                    for (addr, cell) in cells {
-                        let effective = effective_from_parts(&overlay, *addr, cell);
-                        if query.matches(&effective.display) {
-                            matches.push(SearchMatch {
-                                addr: *addr,
-                                source: MatchSource::Display,
-                            });
-                        } else if let Some(formula) = &effective.formula
-                            && query.matches(&formula.expression)
-                        {
-                            matches.push(SearchMatch {
-                                addr: *addr,
-                                source: MatchSource::Formula,
-                            });
-                        }
-                    }
-                }
-                SheetData::Lazy(lazy) => {
-                    let overlay = sheet.formula_overlay.clone();
-                    let _ = lazy.scan_all(&mut |row| {
-                        for (col, cell) in &row.cells {
-                            let addr = CellAddr::new(row.row, *col);
-                            let effective = if let Some(result) = overlay.get(addr) {
-                                EffectiveCell {
-                                    value: result.value.clone(),
-                                    display: result
-                                        .value
-                                        .display_text_with_format(cell.number_format.as_deref()),
-                                    style: cell.style,
-                                    formula: cell.formula.clone(),
-                                    formula_status: result.status.clone(),
-                                }
-                            } else {
-                                cell.effective(
-                                    cell.formula
-                                        .as_ref()
-                                        .map(|formula| formula.status.clone())
-                                        .unwrap_or(FormulaStatus::NotRequested),
-                                )
-                            };
-                            if query.matches(&effective.display) {
-                                matches.push(SearchMatch {
-                                    addr,
-                                    source: MatchSource::Display,
-                                });
-                            } else if let Some(formula) = &effective.formula
-                                && query.matches(&formula.expression)
-                            {
-                                matches.push(SearchMatch {
-                                    addr,
-                                    source: MatchSource::Formula,
-                                });
-                            }
-                        }
-                        std::ops::ControlFlow::Continue(())
-                    });
-                }
-            }
-        }
-        matches.sort_by_key(|matched| (matched.addr.row, matched.addr.col));
-        let visibility = self.active_sheet().map(|sheet| sheet.visibility.clone());
-        let mut index = SearchIndex::new(query, matches);
-        if let Some(visibility) = &visibility {
-            index.sync_visibility(visibility);
-        }
+        self.last_search = Some(query.clone());
+        self.perform_search(query);
+    }
+
+    fn perform_search(&mut self, query: SearchQuery) {
+        let Some(index) = self.build_search_index(query) else {
+            return;
+        };
         let total = index.matches.len();
         let current = index.current_match().cloned();
         self.search_index = Some(index);
         if let Some(matched) = current {
-            self.focus = matched.addr;
-            self.ensure_focus_visible();
+            self.jump_to(matched.sheet, matched.addr);
         } else if total > 0 {
             self.status_message = Some("no visible match".to_string());
         } else {
@@ -659,21 +1541,70 @@ impl AppState {
         }
     }
 
+    fn build_search_index(&mut self, query: SearchQuery) -> Option<SearchIndex> {
+        let workbook = self.workbook.as_mut()?;
+        let mut matches = Vec::new();
+        for (sheet_index, sheet) in workbook.sheets.iter_mut().enumerate() {
+            let range = CellRange::new(CellAddr::new(0, 0), sheet.used_range.end);
+            let Ok(cells) = sheet.collect_cells(range, false) else {
+                continue;
+            };
+            for (addr, cell) in cells {
+                if sheet.merges.anchor_for(addr) != addr {
+                    continue;
+                }
+                let effective = sheet.effective_from_cell(addr, &cell);
+                if query.matches(&effective.display) {
+                    matches.push(SearchMatch {
+                        sheet: sheet_index,
+                        addr,
+                        source: MatchSource::Display,
+                    });
+                } else if let Some(formula) = &effective.formula
+                    && query.matches(&formula.expression)
+                {
+                    matches.push(SearchMatch {
+                        sheet: sheet_index,
+                        addr,
+                        source: MatchSource::Formula,
+                    });
+                }
+            }
+        }
+        matches.sort_by_key(|matched| (matched.sheet, matched.addr.row, matched.addr.col));
+        let visibilities: Vec<_> = workbook
+            .sheets
+            .iter()
+            .map(|sheet| sheet.visibility.clone())
+            .collect();
+        let active_sheet = workbook.active_sheet;
+        let mut index = SearchIndex::new(query, matches);
+        index.set_active_sheet(active_sheet);
+        index.sync_visibility_for(&visibilities);
+        Some(index)
+    }
+
     fn next_match(&mut self, forward: bool) {
-        let Some(visibility) = self.active_sheet().map(|sheet| sheet.visibility.clone()) else {
+        let Some(workbook) = &self.workbook else {
             return;
         };
-        let Some(index) = &mut self.search_index else {
-            return;
-        };
-        let matched = if forward {
-            index.next_visible(&visibility)
-        } else {
-            index.previous_visible(&visibility)
+        let visibilities: Vec<_> = workbook
+            .sheets
+            .iter()
+            .map(|sheet| sheet.visibility.clone())
+            .collect();
+        let matched = {
+            let Some(index) = &mut self.search_index else {
+                return;
+            };
+            if forward {
+                index.next_visible_in(&visibilities)
+            } else {
+                index.previous_visible_in(&visibilities)
+            }
         };
         if let Some(matched) = matched {
-            self.focus = matched.addr;
-            self.ensure_focus_visible();
+            self.jump_to(matched.sheet, matched.addr);
         }
     }
 
@@ -720,7 +1651,6 @@ impl AppState {
     fn rebuild_visibility(&mut self) {
         let mut error_message = None;
         let mut next_focus_row = None;
-        let mut visibility = None;
         if let Some(workbook) = &mut self.workbook {
             let index = workbook.active_sheet;
             if let Some(sheet) = workbook.sheets.get_mut(index) {
@@ -736,16 +1666,28 @@ impl AppState {
                         .find(|row| *row >= self.focus.row)
                         .or_else(|| sheet.visibility.visible_rows().last().copied());
                 }
-                visibility = Some(sheet.visibility.clone());
             }
         }
         if let Some(row) = next_focus_row {
             self.focus = CellAddr::new(row, self.focus.col);
         }
-        if let Some(visibility) = visibility
-            && let Some(index) = &mut self.search_index
-        {
-            index.sync_visibility(&visibility);
+        if self.search_index.is_some() {
+            let active = self.active_sheet_index();
+            let visibilities: Vec<_> = self
+                .workbook
+                .as_ref()
+                .map(|workbook| {
+                    workbook
+                        .sheets
+                        .iter()
+                        .map(|sheet| sheet.visibility.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(index) = &mut self.search_index {
+                index.set_active_sheet(active);
+                index.sync_visibility_for(&visibilities);
+            }
         }
         if let Some(message) = error_message {
             self.status_message = Some(message);
@@ -802,7 +1744,7 @@ impl AppState {
                 cell.style.borders.left.style
             ),
             merge,
-            truncated: LayoutEngine::truncated_at(sheet, &sheet.layout_limits, self.focus),
+            truncated: LayoutEngine::truncated_at(sheet, self.focus, &self.column_widths(sheet)),
             lines: cell.display.lines().map(str::to_string).collect(),
             scroll: self.detail_scroll,
         })
@@ -819,13 +1761,37 @@ impl AppState {
                     "line start / first non-blank / end".to_string(),
                 ),
                 ("v / V".to_string(), "range / row selection".to_string()),
+                ("w".to_string(), "fit columns to screen".to_string()),
                 ("y".to_string(), "copy".to_string()),
-                ("Enter / d".to_string(), "cell detail".to_string()),
-                ("/ n N".to_string(), "search / next / previous".to_string()),
+                (
+                    "i a I A s =".to_string(),
+                    "edit cell / insert value".to_string(),
+                ),
+                ("u / Ctrl-r".to_string(), "undo / redo".to_string()),
+                (
+                    "x r d".to_string(),
+                    "clear / replace / delete operator".to_string(),
+                ),
+                ("K / Enter".to_string(), "cell detail".to_string()),
+                (
+                    "/ n N * #".to_string(),
+                    "workbook search / next / previous / word".to_string(),
+                ),
                 ("f".to_string(), "filter panel".to_string()),
-                ("r".to_string(), "reload file".to_string()),
+                (
+                    "Ctrl-o / Ctrl-i".to_string(),
+                    "jump back / forward".to_string(),
+                ),
+                (":".to_string(), "command line".to_string()),
+                (
+                    ":e / :e!".to_string(),
+                    "reload file / discard edits".to_string(),
+                ),
                 ("Tab".to_string(), "next sheet".to_string()),
-                ("q".to_string(), "quit".to_string()),
+                (
+                    "q / ZZ / ZQ".to_string(),
+                    "quit / save quit / discard quit".to_string(),
+                ),
             ],
         }
     }
@@ -874,10 +1840,14 @@ impl AppState {
     pub fn view(&mut self) -> ScreenView {
         self.ensure_focus_visible();
         let index = self.active_sheet_index();
+        if let Some(search) = &mut self.search_index {
+            search.set_active_sheet(index);
+        }
         let (frozen_rows, start_row) = self
             .active_sheet()
             .map(|sheet| {
-                let frozen = LayoutEngine::effective_freeze(sheet, &self.viewport).rows;
+                let widths = self.column_widths(sheet);
+                let frozen = LayoutEngine::effective_freeze(sheet, &self.viewport, &widths).rows;
                 let start = sheet
                     .visibility
                     .visible_rows()
@@ -913,14 +1883,17 @@ impl AppState {
                 help: None,
                 search_prompt: None,
                 filter_panel: None,
+                input_line: None,
             };
         };
+        let widths = self.column_widths(sheet);
         let plan = LayoutEngine::plan(
             sheet,
             &self.viewport,
             self.focus,
             self.selection.as_ref(),
             self.search_index.as_ref(),
+            &widths,
         );
         let tabs = self
             .workbook
@@ -949,7 +1922,17 @@ impl AppState {
                 .unwrap_or_default(),
             sheet_name: sheet.name.clone(),
             cell_label: self.focus.a1(),
-            mode_label: format!("{:?}", self.mode),
+            mode_label: self.mode.label().to_string(),
+            dirty: self.edit_log.is_dirty(),
+            fit_label: if self.fit_width {
+                if widths.limited() {
+                    "fit:limited".to_string()
+                } else {
+                    "fit:on".to_string()
+                }
+            } else {
+                String::new()
+            },
             selection_count: self
                 .selection
                 .map(|selection| {
@@ -966,11 +1949,24 @@ impl AppState {
                 .search_index
                 .as_ref()
                 .map(|index| {
-                    format!(
-                        "search:{}/{}",
-                        index.current.map(|current| current + 1).unwrap_or(0),
-                        index.matches.len()
-                    )
+                    let position = index.current.map(|current| current + 1).unwrap_or(0);
+                    let context = index
+                        .current_match()
+                        .map(|matched| {
+                            let sheet = self
+                                .workbook
+                                .as_ref()
+                                .and_then(|workbook| workbook.sheets.get(matched.sheet))
+                                .map(|sheet| sheet.name.as_str())
+                                .unwrap_or("?");
+                            format!("{sheet}!{}", matched.addr.a1())
+                        })
+                        .unwrap_or_default();
+                    if context.is_empty() {
+                        format!("search:{position}/{}", index.matches.len())
+                    } else {
+                        format!("search:{position}/{} {context}", index.matches.len())
+                    }
                 })
                 .unwrap_or_default(),
             filter_label: if sheet.filters.is_empty() {
@@ -1017,8 +2013,16 @@ impl AppState {
                 .or_else(|| sheet.warnings.first().cloned()),
         };
         let search = self.search_index.as_ref().map(|index| SearchHighlight {
-            matches: index.matches.iter().map(|matched| matched.addr).collect(),
-            current: index.current_match().map(|matched| matched.addr),
+            matches: index
+                .matches
+                .iter()
+                .filter(|matched| matched.sheet == index.active_sheet)
+                .map(|matched| matched.addr)
+                .collect(),
+            current: index
+                .current_match()
+                .filter(|matched| matched.sheet == index.active_sheet)
+                .map(|matched| matched.addr),
             hidden: index.hidden_matches,
         });
         let detail = if self.mode == Mode::Detail {
@@ -1032,6 +2036,16 @@ impl AppState {
             None
         };
         let search_prompt = if self.mode == Mode::Search || self.search_index.is_some() {
+            let current = self
+                .search_index
+                .as_ref()
+                .and_then(|index| index.current_match());
+            let sheet = current.and_then(|matched| {
+                self.workbook
+                    .as_ref()
+                    .and_then(|workbook| workbook.sheets.get(matched.sheet))
+                    .map(|sheet| sheet.name.clone())
+            });
             Some(SearchPromptView {
                 query: self.search_query.clone(),
                 current: self
@@ -1051,10 +2065,23 @@ impl AppState {
                     .map(|index| index.hidden_matches)
                     .unwrap_or(0),
                 searching: false,
+                sheet,
+                cell: current.map(|matched| matched.addr.a1()),
             })
         } else {
             None
         };
+        let input_line = self.input.as_ref().map(|input| {
+            let prompt = match input.kind {
+                InputKind::Cell { addr, .. } => format!("{} > ", addr.a1()),
+                InputKind::Command => ":".to_string(),
+            };
+            InputLineView {
+                prompt,
+                text: input.text(),
+                cursor: input.cursor,
+            }
+        });
         let filter_panel = if self.mode == Mode::Filter {
             self.filter_panel_view()
         } else {
@@ -1074,6 +2101,7 @@ impl AppState {
             help,
             search_prompt,
             filter_panel,
+            input_line,
         }
     }
 }
@@ -1171,33 +2199,4 @@ fn apply_filter_snapshots(workbook: &mut WorkbookModel, snapshots: &[FilterSnaps
         }
     }
     reset
-}
-
-fn effective_from_parts(
-    overlay: &FormulaOverlay,
-    addr: CellAddr,
-    cell: &crate::domain::cell::Cell,
-) -> EffectiveCell {
-    if let Some(result) = overlay.get(addr) {
-        let mut formula = cell.formula.clone();
-        if let Some(info) = formula.as_mut() {
-            info.evaluated = Some(result.value.clone());
-            info.status = result.status.clone();
-        }
-        return EffectiveCell {
-            value: result.value.clone(),
-            display: result
-                .value
-                .display_text_with_format(cell.number_format.as_deref()),
-            style: cell.style,
-            formula,
-            formula_status: result.status.clone(),
-        };
-    }
-    let status = cell
-        .formula
-        .as_ref()
-        .map(|formula| formula.status.clone())
-        .unwrap_or(FormulaStatus::NotRequested);
-    cell.effective(status)
 }

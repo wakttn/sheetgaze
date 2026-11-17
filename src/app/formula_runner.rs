@@ -1,4 +1,7 @@
+use std::path::PathBuf;
 use std::sync::mpsc::TryRecvError;
+
+use tempfile::NamedTempFile;
 
 use crate::domain::formula::{RecalcConfig, RecalcPolicy};
 use crate::domain::task::Generation;
@@ -15,6 +18,7 @@ pub struct FormulaStart {
 #[derive(Default)]
 pub struct FormulaRunner {
     handle: Option<FormulaHandle>,
+    temp: Option<NamedTempFile>,
 }
 
 impl FormulaRunner {
@@ -23,11 +27,39 @@ impl FormulaRunner {
     }
 
     pub fn restart(&mut self, workbook: &mut WorkbookModel, config: &RecalcConfig) -> FormulaStart {
+        let path = workbook.source.path.clone();
+        let file_bytes = workbook.source.fingerprint.len;
+        self.restart_with_path(workbook, config, path, file_bytes, None)
+    }
+
+    /// Restarts calculation from a temporary patched workbook that contains
+    /// unsaved edits. The temporary file is kept alive until the job finishes.
+    pub fn restart_with_temp(
+        &mut self,
+        workbook: &mut WorkbookModel,
+        config: &RecalcConfig,
+        temp: NamedTempFile,
+    ) -> FormulaStart {
+        let path = temp.path().to_path_buf();
+        let file_bytes = temp
+            .as_file()
+            .metadata()
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        self.restart_with_path(workbook, config, path, file_bytes, Some(temp))
+    }
+
+    fn restart_with_path(
+        &mut self,
+        workbook: &mut WorkbookModel,
+        config: &RecalcConfig,
+        path: PathBuf,
+        file_bytes: u64,
+        temp: Option<NamedTempFile>,
+    ) -> FormulaStart {
         self.cancel();
         let generation = workbook.generation.0.saturating_add(1);
         workbook.generation = Generation(generation);
-        let path = workbook.source.path.clone();
-        let file_bytes = workbook.source.fingerprint.len;
         let mut formula_cells = Vec::new();
         let mut total_cells = 0u64;
         for sheet in &workbook.sheets {
@@ -49,6 +81,7 @@ impl FormulaRunner {
                     .then(|| "formula recalculation skipped: size policy".to_string()),
             };
         }
+        self.temp = temp;
         self.handle = Some(formula::spawn_recalculation(
             path,
             formula_cells,
@@ -72,6 +105,7 @@ impl FormulaRunner {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.handle = None;
+                    self.temp = None;
                     break;
                 }
             }
@@ -82,13 +116,16 @@ impl FormulaRunner {
     /// Blocks until the current recalculation finishes and returns its message.
     pub fn wait(&mut self) -> Option<FormulaMessage> {
         let handle = self.handle.take()?;
-        handle.receiver.recv().ok()
+        let message = handle.receiver.recv().ok();
+        self.temp = None;
+        message
     }
 
     pub fn cancel(&mut self) {
         if let Some(handle) = self.handle.take() {
             handle.cancel.cancel();
         }
+        self.temp = None;
     }
 }
 

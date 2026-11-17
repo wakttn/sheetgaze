@@ -446,6 +446,136 @@ pub struct StyledSpan {
     pub style: CellStyle,
 }
 
+/// Column widths used for one render. The sheet layout keeps the original
+/// widths; this table may scale them down to fit the viewport.
+#[derive(Clone, Debug, Default)]
+pub struct ColumnWidths {
+    widths: Vec<u16>,
+    limited: bool,
+}
+
+/// Result of scaling column widths into an available viewport width.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FitWidths {
+    pub widths: Vec<u16>,
+    /// True when even one cell per column plus gutters cannot fit.
+    pub limited: bool,
+}
+
+impl ColumnWidths {
+    pub fn from_sheet(sheet: &Sheet) -> Self {
+        let default_width = sheet.layout_limits.default_col_width.max(1);
+        let end = sheet.used_range.end.col as usize;
+        let widths = (0..=end)
+            .map(|col| {
+                sheet
+                    .layout
+                    .column_widths
+                    .get(col)
+                    .copied()
+                    .unwrap_or(default_width)
+                    .max(1)
+            })
+            .collect();
+        Self {
+            widths,
+            limited: false,
+        }
+    }
+
+    pub fn fit(sheet: &Sheet, available: u16) -> Self {
+        let base = Self::from_sheet(sheet);
+        let fitted = fit_column_widths(&base.widths, available);
+        Self {
+            widths: fitted.widths,
+            limited: fitted.limited,
+        }
+    }
+
+    pub fn width(&self, col: u32) -> u16 {
+        self.widths.get(col as usize).copied().unwrap_or(1).max(1)
+    }
+
+    pub fn total_slots(&self) -> u32 {
+        self.widths
+            .iter()
+            .map(|width| *width as u32 + CELL_GUTTER as u32)
+            .sum()
+    }
+
+    pub fn limited(&self) -> bool {
+        self.limited
+    }
+}
+
+/// Scales `base` column widths down so that the columns and their gutters fit
+/// in `available` terminal cells. Columns are never widened and always keep at
+/// least one cell. Leftover cells are assigned in column order so the result is
+/// deterministic.
+pub fn fit_column_widths(base: &[u16], available: u16) -> FitWidths {
+    let count = base.len();
+    if count == 0 {
+        return FitWidths::default();
+    }
+    let base: Vec<u32> = base.iter().map(|width| (*width).max(1) as u32).collect();
+    let base_cells: u32 = base.iter().sum();
+    let gutters = count as u32 * CELL_GUTTER as u32;
+    if base_cells.saturating_add(gutters) <= available as u32 {
+        return FitWidths {
+            widths: base.iter().map(|width| *width as u16).collect(),
+            limited: false,
+        };
+    }
+
+    let budget = (available as u32).saturating_sub(gutters);
+    if budget < count as u32 {
+        return FitWidths {
+            widths: vec![1; count],
+            limited: true,
+        };
+    }
+
+    let extra = budget - count as u32;
+    let mut widths = Vec::with_capacity(count);
+    let mut used = 0u32;
+    let mut remainders = Vec::with_capacity(count);
+    for (index, width) in base.iter().enumerate() {
+        let scaled = width.saturating_mul(extra);
+        let whole = scaled / base_cells;
+        let remainder = scaled % base_cells;
+        let next = (1 + whole).min(*width);
+        used = used.saturating_add(next);
+        widths.push(next as u16);
+        remainders.push((remainder, index));
+    }
+
+    // Flooring leaves at most one cell per column unassigned. If a column is
+    // already at its original width, skip it and continue down the list.
+    let mut remaining = budget.saturating_sub(used);
+    remainders.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    while remaining > 0 {
+        let mut assigned = false;
+        for (_, index) in &remainders {
+            if remaining == 0 {
+                break;
+            }
+            if (widths[*index] as u32) < base[*index] {
+                widths[*index] += 1;
+                remaining -= 1;
+                assigned = true;
+            }
+        }
+        if !assigned {
+            break;
+        }
+    }
+
+    FitWidths {
+        widths,
+        limited: false,
+    }
+}
+
 pub struct LayoutEngine;
 
 impl LayoutEngine {
@@ -465,7 +595,11 @@ impl LayoutEngine {
         builder.finish(&sheet.merges, None, sheet.used_range)
     }
 
-    pub fn effective_freeze(sheet: &Sheet, viewport: &Viewport) -> EffectiveFreeze {
+    pub fn effective_freeze(
+        sheet: &Sheet,
+        viewport: &Viewport,
+        widths: &ColumnWidths,
+    ) -> EffectiveFreeze {
         if !sheet.freeze.is_active() {
             return EffectiveFreeze::default();
         }
@@ -493,8 +627,7 @@ impl LayoutEngine {
         let mut width = 0u16;
         let max_frozen_width = viewport.width.saturating_sub(12);
         for col in 0..requested_cols {
-            let next =
-                column_width(&sheet.layout, col, &sheet.layout_limits).saturating_add(CELL_GUTTER);
+            let next = widths.width(col).saturating_add(CELL_GUTTER);
             if width.saturating_add(next) > max_frozen_width {
                 break;
             }
@@ -515,9 +648,10 @@ impl LayoutEngine {
         focus: CellAddr,
         selection: Option<&Selection>,
         search: Option<&SearchIndex>,
+        widths: &ColumnWidths,
     ) -> RenderPlan {
         let layout = &sheet.layout;
-        let freeze = Self::effective_freeze(sheet, viewport);
+        let freeze = Self::effective_freeze(sheet, viewport, widths);
         let focus = sheet.merges.anchor_for(focus);
         let mut frozen = Vec::new();
         let mut scroll = Vec::new();
@@ -536,6 +670,7 @@ impl LayoutEngine {
                 focus,
                 row,
                 freeze.cols,
+                widths,
             ));
         }
         let visible = sheet.visibility.visible_rows();
@@ -559,19 +694,20 @@ impl LayoutEngine {
                 focus,
                 row,
                 freeze.cols,
+                widths,
             ));
         }
         RenderPlan {
             frozen_rows: frozen,
             scroll_rows: scroll,
-            columns: plan_columns(sheet, viewport, freeze.cols),
+            columns: plan_columns(sheet, viewport, freeze.cols, widths),
             frozen_cols: freeze.cols,
             scroll_left_col: viewport.left_col,
             freeze,
         }
     }
 
-    pub fn measure_cell(sheet: &Sheet, limits: &LayoutLimits, addr: CellAddr) -> CellMeasure {
+    pub fn measure_cell(sheet: &Sheet, addr: CellAddr, widths: &ColumnWidths) -> CellMeasure {
         let addr = sheet.merges.anchor_for(addr);
         let layout = &sheet.layout;
         let effective = sheet.effective_cell(addr).unwrap_or_else(|| EffectiveCell {
@@ -594,11 +730,11 @@ impl LayoutEngine {
             region
                 .range
                 .cols()
-                .map(|col| column_width(layout, col, limits))
+                .map(|col| widths.width(col))
                 .sum::<u16>()
                 .saturating_add(cols.saturating_sub(1) * CELL_GUTTER)
         } else {
-            column_width(layout, addr.col, limits)
+            widths.width(addr.col)
         };
         let mut width = base_width;
         let mut overflow = false;
@@ -622,7 +758,7 @@ impl LayoutEngine {
                 if next_borders.left.is_visible() {
                     break;
                 }
-                let next_width = column_width(layout, next, limits);
+                let next_width = widths.width(next);
                 width = width.saturating_add(next_width).saturating_add(
                     if next_borders.right.is_visible() {
                         0
@@ -675,8 +811,8 @@ impl LayoutEngine {
         }
     }
 
-    pub fn truncated_at(sheet: &Sheet, limits: &LayoutLimits, addr: CellAddr) -> bool {
-        Self::measure_cell(sheet, limits, addr).truncated
+    pub fn truncated_at(sheet: &Sheet, addr: CellAddr, widths: &ColumnWidths) -> bool {
+        Self::measure_cell(sheet, addr, widths).truncated
     }
 }
 
@@ -750,9 +886,12 @@ impl LayoutSnapshot {
     }
 }
 
-fn plan_columns(sheet: &Sheet, viewport: &Viewport, frozen_cols: u32) -> Vec<RenderColumn> {
-    let layout = &sheet.layout;
-    let limits = sheet.layout_limits;
+fn plan_columns(
+    sheet: &Sheet,
+    viewport: &Viewport,
+    frozen_cols: u32,
+    widths: &ColumnWidths,
+) -> Vec<RenderColumn> {
     let scroll_start = viewport.left_col.max(frozen_cols);
     let mut columns = Vec::new();
     let mut x = 0u16;
@@ -760,7 +899,7 @@ fn plan_columns(sheet: &Sheet, viewport: &Viewport, frozen_cols: u32) -> Vec<Ren
         if x >= viewport.width {
             break;
         }
-        let width = column_width(layout, col, &limits);
+        let width = widths.width(col);
         columns.push(RenderColumn { col, x, width });
         x = x.saturating_add(width).saturating_add(CELL_GUTTER);
     }
@@ -776,20 +915,11 @@ fn row_height(layout: &LayoutSnapshot, row: u32) -> u16 {
         .max(1) as u16
 }
 
-fn column_width(layout: &LayoutSnapshot, col: u32, limits: &LayoutLimits) -> u16 {
-    layout
-        .column_widths
-        .get(col as usize)
-        .copied()
-        .unwrap_or(limits.default_col_width)
-        .max(1)
-}
-
-fn merged_width(layout: &LayoutSnapshot, range: CellRange, limits: &LayoutLimits) -> u16 {
+fn merged_width(widths: &ColumnWidths, range: CellRange) -> u16 {
     let cols = range.col_count().max(1) as u16;
     range
         .cols()
-        .map(|col| column_width(layout, col, limits))
+        .map(|col| widths.width(col))
         .fold(0u16, u16::saturating_add)
         .saturating_add(cols.saturating_sub(1) * CELL_GUTTER)
 }
@@ -809,6 +939,7 @@ fn merge_line_offset(layout: &LayoutSnapshot, range: CellRange, row: u32) -> u16
         .fold(0u16, u16::saturating_add)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_row(
     sheet: &Sheet,
     viewport: &Viewport,
@@ -817,9 +948,9 @@ fn render_row(
     focus: CellAddr,
     row: u32,
     frozen_cols: u32,
+    widths: &ColumnWidths,
 ) -> RenderRow {
     let layout = &sheet.layout;
-    let limits = sheet.layout_limits;
     let height = row_height(layout, row);
     let mut cells = Vec::new();
     let mut x = 0u16;
@@ -844,13 +975,13 @@ fn render_row(
                 // start column is horizontally scrolled out, keep the x
                 // position of the remaining columns consistent.
                 if region.range.start.col < scroll_start {
-                    x = x.saturating_add(column_width(layout, col, &limits) + CELL_GUTTER);
+                    x = x.saturating_add(widths.width(col) + CELL_GUTTER);
                 }
                 continue;
             }
 
             let anchor = region.anchor;
-            let width = merged_width(layout, region.range, &limits);
+            let width = merged_width(widths, region.range);
             let total_height = merge_total_height(layout, region.range) as usize;
             let line_offset = merge_line_offset(layout, region.range, row) as usize;
             let effective = sheet
@@ -919,7 +1050,7 @@ fn render_row(
             continue;
         }
 
-        let width = column_width(layout, col, &limits);
+        let width = widths.width(col);
         let effective = sheet.effective_cell(addr).unwrap_or_else(|| EffectiveCell {
             value: CellValue::Empty,
             display: String::new(),
@@ -950,7 +1081,7 @@ fn render_row(
                 if next_borders.left.is_visible() {
                     break;
                 }
-                let next_width = column_width(layout, next, &limits);
+                let next_width = widths.width(next);
                 cell_width = cell_width.saturating_add(next_width).saturating_add(
                     if next_borders.right.is_visible() {
                         0
@@ -1172,5 +1303,80 @@ mod tests {
         );
         assert!(layout.column_widths[1] > 10);
         assert!(layout.row_heights[1] > 1);
+    }
+
+    #[test]
+    fn fit_widths_keep_base_when_already_fits() {
+        let fitted = fit_column_widths(&[8, 4, 2], 20);
+        assert_eq!(fitted.widths, vec![8, 4, 2]);
+        assert!(!fitted.limited);
+    }
+
+    #[test]
+    fn fit_widths_scale_proportionally_and_preserve_order() {
+        let fitted = fit_column_widths(&[20, 10, 5], 20);
+        assert_eq!(fitted.widths, vec![9, 5, 3]);
+        assert_eq!(
+            fitted
+                .widths
+                .iter()
+                .map(|width| *width as u32 + CELL_GUTTER as u32)
+                .sum::<u32>(),
+            20
+        );
+        assert!(!fitted.limited);
+        assert!(fitted.widths[0] > fitted.widths[1]);
+        assert!(fitted.widths[1] > fitted.widths[2]);
+    }
+
+    #[test]
+    fn fit_widths_never_exceed_base_and_keep_one_cell() {
+        let fitted = fit_column_widths(&[1, 100, 3], 10);
+        assert_eq!(fitted.widths, vec![1, 5, 1]);
+        assert!(fitted.widths[1] <= 100);
+        assert!(fitted.widths.iter().all(|width| *width >= 1));
+        assert!(!fitted.limited);
+    }
+
+    #[test]
+    fn fit_widths_report_limited_when_even_one_cell_does_not_fit() {
+        let fitted = fit_column_widths(&[2, 2, 2], 5);
+        assert_eq!(fitted.widths, vec![1, 1, 1]);
+        assert!(fitted.limited);
+    }
+
+    #[test]
+    fn fit_widths_handle_empty_and_single_column() {
+        assert_eq!(
+            fit_column_widths(&[], 10),
+            FitWidths {
+                widths: Vec::new(),
+                limited: false
+            }
+        );
+        let fitted = fit_column_widths(&[10], 11);
+        assert_eq!(fitted.widths, vec![10]);
+        assert!(!fitted.limited);
+        let fitted = fit_column_widths(&[10], 5);
+        assert_eq!(fitted.widths, vec![4]);
+        assert!(!fitted.limited);
+        let fitted = fit_column_widths(&[10], 1);
+        assert_eq!(fitted.widths, vec![1]);
+        assert!(fitted.limited);
+    }
+
+    #[test]
+    fn fit_widths_are_deterministic_for_ties() {
+        let first = fit_column_widths(&[5, 5, 5], 8);
+        let second = fit_column_widths(&[5, 5, 5], 8);
+        assert_eq!(first, second);
+        assert_eq!(first.widths.iter().sum::<u16>() + 3, 8);
+    }
+
+    #[test]
+    fn fit_widths_clamp_zero_base_width_to_one() {
+        let fitted = fit_column_widths(&[0, 4], 10);
+        assert_eq!(fitted.widths, vec![1, 4]);
+        assert!(!fitted.limited);
     }
 }

@@ -98,6 +98,9 @@ pub struct Cli {
     /// How column widths and row heights are chosen.
     #[arg(long, value_enum, default_value_t = LayoutModeArg::Excel)]
     pub layout: LayoutModeArg,
+    /// Shrink all used columns proportionally so the table fits the terminal width.
+    #[arg(long)]
+    pub fit_width: bool,
     #[arg(long)]
     pub sheet: Option<String>,
     #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
@@ -129,6 +132,9 @@ pub struct Cli {
     pub recalc_max_bytes: u64,
     #[arg(long)]
     pub no_filter: bool,
+    /// Open the workbook read-only and disable cell editing.
+    #[arg(long)]
+    pub read_only: bool,
     #[arg(long, value_enum, default_value_t = WatchModeArg::Poll)]
     pub watch: WatchModeArg,
     #[arg(long, default_value_t = 1_000)]
@@ -169,6 +175,7 @@ impl Default for Config {
             max_col_width: 65,
             max_row_lines: 10,
             layout: LayoutModeArg::Excel,
+            fit_width: false,
             sheet: None,
             color: ColorMode::Auto,
             fill_mode: FillMode::Background,
@@ -184,6 +191,7 @@ impl Default for Config {
             recalc_max_cells: 500_000,
             recalc_max_bytes: 64 * 1024 * 1024,
             no_filter: false,
+            read_only: false,
             watch: WatchModeArg::Poll,
             watch_interval_ms: 1_000,
             max_copy_cells: 200_000,
@@ -275,6 +283,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn read_only_flag_parses() {
+        let cli = Cli::try_parse_from(["sheetgaze", "--read-only", "book.xlsx"]).unwrap();
+        assert!(cli.read_only);
+        assert!(!Config::default().cli.read_only);
+    }
+
+    #[test]
     fn fill_mode_defaults_to_background_and_parses_border() {
         assert_eq!(Config::default().cli.fill_mode, FillMode::Background);
         let cli = Cli::try_parse_from(["sheetgaze", "--fill-mode", "border", "book.xlsx"]).unwrap();
@@ -326,6 +341,28 @@ mod tests {
             Config::from_cli(cli).unwrap().layout_mode,
             LayoutMode::Content
         );
+    }
+
+    #[test]
+    fn fit_width_defaults_off_and_parses_the_flag() {
+        assert!(!Config::default().cli.fit_width);
+        let cli = Cli::try_parse_from(["sheetgaze", "--fit-width", "book.xlsx"]).unwrap();
+        assert!(cli.fit_width);
+        assert!(Config::from_cli(cli).unwrap().cli.fit_width);
+
+        let cli = Cli::try_parse_from([
+            "sheetgaze",
+            "--fit-width",
+            "--layout",
+            "content",
+            "book.xlsx",
+        ])
+        .unwrap();
+        assert!(cli.fit_width);
+        assert_eq!(cli.layout, LayoutModeArg::Content);
+        let config = Config::from_cli(cli).unwrap();
+        assert!(config.cli.fit_width);
+        assert_eq!(config.layout_mode, LayoutMode::Content);
     }
 
     #[test]

@@ -8,3 +8,4 @@ pub mod row_cache;
 pub mod sheet_meta;
 pub mod watch;
 pub mod xlsx;
+pub mod xlsx_write;

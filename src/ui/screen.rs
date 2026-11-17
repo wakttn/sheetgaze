@@ -8,6 +8,7 @@ use crate::ui::detail;
 use crate::ui::filter_panel;
 use crate::ui::grid::GridWidget;
 use crate::ui::help;
+use crate::ui::input_line;
 use crate::ui::search_prompt;
 use crate::ui::status;
 use crate::ui::theme::Theme;
@@ -70,12 +71,21 @@ impl Screen {
         frame.render_widget(Paragraph::new(status::status_line(view)), chunks[0]);
         frame.render_widget(GridWidget { view, theme }, chunks[1]);
         if show_tabs {
-            let bottom = if let Some(prompt) = &view.search_prompt {
+            let bottom = if let Some(input) = &view.input_line {
+                input_line::line(input)
+            } else if let Some(prompt) = &view.search_prompt {
                 search_prompt::line(prompt)
             } else {
                 status::tabs_line(view)
             };
             frame.render_widget(Paragraph::new(bottom), chunks[2]);
+            if let Some(input) = &view.input_line {
+                let x = area
+                    .x
+                    .saturating_add(input_line::cursor_column(input, area.width));
+                let y = chunks[2].y;
+                frame.set_cursor_position((x, y));
+            }
         }
         match view.mode {
             Mode::Detail => {

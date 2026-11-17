@@ -11,12 +11,16 @@
 - Read csv with BOM / Shift_JIS / CP932 / EUC-JP / UTF-16 detection
 - Recalculate formulas with formualizer in a background thread
 - Excel autoFilter support (worksheet and table definitions) with value lists, custom conditions, and Top10
-- Search with smart-case literal matching, `n` / `N` navigation, and filter-aware skipping
+- Search all sheets with smart-case literal matching, `n` / `N` cross-sheet navigation, `*` / `#` word search, and filter-aware skipping
+- Replace cell text with `:s`, `:%s`, or `:gs` (current cell / sheet / all sheets), with literal smart-case matching and `g` / `i` / `I` / `n` flags
+- Edit xlsx cell values and formulas with Vim-style modal keys, undo / redo, and atomic OOXML save that preserves styles, merges, filters, and other workbook parts
+- Recalculate formulas from unsaved edits using a temporary patched workbook
 - Prefer explicit Excel column widths and row heights, with content-based auto-fit for unspecified cells and configurable caps (`--layout`)
+- Toggle fit-to-width mode with `w` or start in it with `--fit-width`, proportionally shrinking all used columns into the terminal width
 - Lazy row loading with an LRU row cache for large files
 - Copy a cell or range as TSV via OSC 52 (system clipboard is an optional feature)
-- Watch the opened file and reload it automatically, with manual `r` reload
-- Vim-style navigation plus arrow keys
+- Watch the opened file and reload it automatically, with manual `:e` reload
+- Vim-style navigation and editing plus arrow keys
 
 ## Build and run
 
@@ -52,12 +56,14 @@ Useful options:
 --max-col-width 65
 --max-row-lines 10
 --layout excel|content
+--fit-width
 --sheet Sheet1
 --encoding shift_jis
 --lazy auto|always|never
 --row-cache-rows 2000
 --recalc auto|always|never
 --no-filter
+--read-only
 --watch poll|native|auto|off
 --watch-interval-ms 1000
 --max-copy-cells 200000
@@ -80,14 +86,29 @@ cargo run --release --features system-clipboard -- path/to/book.xlsx
 - `0` / `^` / `$`: line start / first non-blank / line end
 - `Ctrl-d` / `Ctrl-u`, `PageUp` / `PageDown`: page movement
 - `v` / `V`: range / row selection
-- `y`: copy
-- `Enter` or `d`: cell detail
-- `/`, `n`, `N`: search / next / previous
+- `w`: toggle fit-to-width mode
+- `y`: copy (exits visual mode)
+- `i` / `a` / `I` / `A` / `F2`: edit cell (start / end cursor)
+- `s`: clear the cell and start editing
+- `=`: start editing a formula
+- `Enter` / `Tab` / `Shift-Tab`: commit and move down / right / left
+- `Esc`: commit edit; `Ctrl-c`: cancel edit
+- `x`: clear cell or selection
+- `r{char}`: replace cell or selection contents
+- `d` + motion / `dd` / `D`: clear contents (row structure is kept)
+- `u` / `Ctrl-r`: undo / redo
+- `K` or `Enter`: cell detail
+- `/`, `n`, `N`: workbook search / next / previous
+- `*` / `#`: search the current cell value
+- `Ctrl-o` / `Ctrl-i`: jump back / forward
+- `:`: command line (`:w`, `:w!`, `:q`, `:q!`, `:wq`, `:x`, `:e`, `:e!`, `:s`, `:%s`, `:gs`, `:goto Sheet!A1`)
+- `ZZ` / `ZQ`: save and quit / discard and quit
 - `f`: filter panel
-- `r`: reload the file manually
 - `Tab` / `Shift-Tab`: switch sheet
 - `?`: help
 - `q`: quit
+
+Editing is available for xlsx files. CSV and `--read-only` workbooks remain read-only. Saving is in-place; the first save after editing also resets the in-memory undo history because the OOXML file is updated atomically.
 
 ## Fixtures
 
@@ -145,6 +166,8 @@ produce a half-populated public release.
 
 - Automatic reload compares the file's existence, size, and modification time only; a rewrite that preserves both size and mtime is not detected. Use `r` in that case.
 - Search matching runs synchronously; formula recalculation runs in a background thread.
+- Fit-to-width mode shrinks columns only; row heights are not recalculated, so wrapped cells may be truncated with `…` until the mode is turned off.
+- If even one-character columns cannot fit, fit-to-width stays at maximum compression, reports `fit:limited`, and keeps horizontal scrolling.
 - CSV decoding currently reads the source file into memory before writing the UTF-8 spill file; row access is lazy after that.
 - Multi-row merged cells distribute wrapped text across the merged rows; a merged range that starts left of the viewport is not partially clipped yet.
 - Horizontal borders use terminal underline attributes; double/thick horizontal styles are approximated, and underline color depends on terminal support.

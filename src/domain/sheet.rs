@@ -54,6 +54,8 @@ pub struct Sheet {
     /// `None` when the sheet has no data (formatting-only cells are ignored).
     pub data_rows: Option<(u32, u32)>,
     pub data: SheetData,
+    /// Unsaved edits layered over `data`. The base workbook is never mutated.
+    pub edits: HashMap<CellAddr, Cell>,
     pub merges: MergeIndex,
     pub merge_borders: HashMap<CellAddr, CellBorders>,
     pub layout: LayoutSnapshot,
@@ -93,11 +95,20 @@ impl Sheet {
     }
 
     pub fn cell(&self, addr: CellAddr) -> Option<&Cell> {
-        self.resolve(addr)?;
-        match &self.data {
-            SheetData::Eager(cells) => cells.get(&addr),
-            SheetData::Lazy(lazy) => lazy.cell(addr),
+        let anchor = self.resolve(addr)?;
+        if let Some(cell) = self.edits.get(&anchor) {
+            return Some(cell);
         }
+        match &self.data {
+            SheetData::Eager(cells) => cells.get(&anchor),
+            SheetData::Lazy(lazy) => lazy.cell(anchor),
+        }
+    }
+
+    /// Returns the raw stored cell without formula overlays. Used to capture
+    /// undo snapshots.
+    pub fn raw_cell(&self, addr: CellAddr) -> Option<&Cell> {
+        self.cell(addr)
     }
 
     pub fn resolve(&self, addr: CellAddr) -> Option<CellAddr> {
@@ -111,6 +122,9 @@ impl Sheet {
         let Some(anchor) = self.resolve(addr) else {
             return CellRead::Missing;
         };
+        if let Some(cell) = self.edits.get(&anchor) {
+            return CellRead::Loaded(self.effective_from_cell(anchor, cell));
+        }
         match &self.data {
             SheetData::Eager(cells) => cells
                 .get(&anchor)
@@ -183,6 +197,50 @@ impl Sheet {
         effective
     }
 
+    /// Applies or removes an unsaved cell edit. The base sheet data is left
+    /// untouched; `None` reveals the original cell again. Bounds and layout
+    /// grow immediately, while filter visibility is rebuilt by the caller.
+    pub fn set_edit_cell(&mut self, addr: CellAddr, cell: Option<Cell>) {
+        let anchor = if self.used_range.contains(addr) {
+            self.merges.anchor_for(addr)
+        } else {
+            addr
+        };
+        if let Some(cell) = cell {
+            self.extend_bounds(anchor);
+            if cell.has_content() {
+                self.data_rows = Some(match self.data_rows {
+                    Some((first, last)) => (first.min(anchor.row), last.max(anchor.row)),
+                    None => (anchor.row, anchor.row),
+                });
+            }
+            let merge = self.merges.region_at(anchor).map(|region| region.range);
+            self.layout.grow_for_cell(
+                anchor,
+                &cell.display,
+                cell.wrap_text,
+                merge,
+                &self.layout_limits,
+            );
+            self.edits.insert(anchor, cell);
+        } else {
+            self.edits.remove(&anchor);
+        }
+        self.formula_overlay.values.remove(&anchor);
+        self.formula_cells.retain(|item| *item != anchor);
+        if self.cell(anchor).is_some_and(|cell| cell.formula.is_some()) {
+            self.formula_cells.push(anchor);
+        }
+        self.invalidate_filter_masks();
+    }
+
+    fn extend_bounds(&mut self, addr: CellAddr) {
+        self.used_range.end.row = self.used_range.end.row.max(addr.row);
+        self.used_range.end.col = self.used_range.end.col.max(addr.col);
+        self.meta.row_count = self.meta.row_count.max(addr.row + 1);
+        self.meta.column_count = self.meta.column_count.max(addr.col + 1);
+    }
+
     pub fn invalidate_filter_masks(&mut self) {
         self.filter_masks_dirty = !self.filters.is_empty();
     }
@@ -216,6 +274,7 @@ impl Sheet {
         let row_count = self.meta.row_count;
         let columns = filter_column_indices(&filters);
         let overlay = self.formula_overlay.clone();
+        let edits = self.edits.clone();
         let mut builder = FilterMaskBuilder::new(&filters, row_count);
         match &mut self.data {
             SheetData::Eager(cells) => {
@@ -224,8 +283,9 @@ impl Sheet {
                         .iter()
                         .map(|col| {
                             let addr = CellAddr::new(row, *col);
-                            cells
+                            edits
                                 .get(&addr)
+                                .or_else(|| cells.get(&addr))
                                 .map(|cell| FilterValue::from_cell(addr, cell, &overlay))
                                 .unwrap_or_default()
                         })
@@ -239,7 +299,9 @@ impl Sheet {
                         .iter()
                         .map(|col| {
                             let addr = CellAddr::new(row.row, *col);
-                            row.cell(*col)
+                            edits
+                                .get(&addr)
+                                .or_else(|| row.cell(*col))
                                 .map(|cell| FilterValue::from_cell(addr, cell, &overlay))
                                 .unwrap_or_default()
                         })
@@ -269,9 +331,67 @@ impl Sheet {
     }
 
     pub fn all_cells(&self) -> Vec<(CellAddr, &Cell)> {
-        match &self.data {
+        let mut cells: Vec<(CellAddr, &Cell)> = match &self.data {
             SheetData::Eager(cells) => cells.iter().map(|(addr, cell)| (*addr, cell)).collect(),
             SheetData::Lazy(_) => Vec::new(),
+        };
+        for (addr, cell) in &self.edits {
+            if let Some(slot) = cells.iter_mut().find(|(item, _)| item == addr) {
+                slot.1 = cell;
+            } else {
+                cells.push((*addr, cell));
+            }
         }
+        cells.sort_by_key(|(addr, _)| (addr.row, addr.col));
+        cells
+    }
+
+    /// Collects owned cells intersecting `range`, with unsaved edits taking
+    /// precedence. Lazy sheets are scanned through their row source; callers
+    /// that only need a current viewport should use `read_cell` instead.
+    pub fn collect_cells(
+        &mut self,
+        range: CellRange,
+        visible_only: bool,
+    ) -> Result<Vec<(CellAddr, Cell)>, LoadError> {
+        let visibility = self.visibility.clone();
+        let mut found: HashMap<CellAddr, Cell> = HashMap::new();
+        let include = |addr: CellAddr| {
+            range.contains(addr) && (!visible_only || visibility.is_visible(addr.row))
+        };
+        match &mut self.data {
+            SheetData::Eager(cells) => {
+                for (addr, cell) in cells.iter() {
+                    if include(*addr) {
+                        found.insert(*addr, cell.clone());
+                    }
+                }
+            }
+            SheetData::Lazy(lazy) => {
+                lazy.scan_all(&mut |row| {
+                    if row.row < range.start.row || row.row > range.end.row {
+                        return std::ops::ControlFlow::Continue(());
+                    }
+                    if visible_only && !visibility.is_visible(row.row) {
+                        return std::ops::ControlFlow::Continue(());
+                    }
+                    for (col, cell) in &row.cells {
+                        let addr = CellAddr::new(row.row, *col);
+                        if range.contains(addr) {
+                            found.insert(addr, cell.clone());
+                        }
+                    }
+                    std::ops::ControlFlow::Continue(())
+                })?;
+            }
+        }
+        for (addr, cell) in &self.edits {
+            if include(*addr) {
+                found.insert(*addr, cell.clone());
+            }
+        }
+        let mut cells: Vec<(CellAddr, Cell)> = found.into_iter().collect();
+        cells.sort_by_key(|(addr, _)| (addr.row, addr.col));
+        Ok(cells)
     }
 }

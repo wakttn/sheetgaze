@@ -1,11 +1,14 @@
 pub mod addr;
 pub mod cell;
+pub mod command;
 pub mod conditional;
 pub mod copy;
+pub mod edit;
 pub mod error;
 pub mod filter;
 pub mod formula;
 pub mod freeze;
+pub mod jump;
 pub mod layout;
 pub mod merge;
 pub mod mode;

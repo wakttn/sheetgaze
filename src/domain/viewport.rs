@@ -1,6 +1,6 @@
 use crate::domain::addr::CellAddr;
 use crate::domain::freeze::EffectiveFreeze;
-use crate::domain::layout::{CELL_GUTTER, LayoutLimits, LayoutSnapshot, Viewport};
+use crate::domain::layout::{CELL_GUTTER, ColumnWidths, Viewport};
 use crate::domain::sheet::Sheet;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -17,10 +17,11 @@ impl ViewportPlanner {
         viewport: &Viewport,
         focus: CellAddr,
         freeze: EffectiveFreeze,
+        widths: &ColumnWidths,
     ) -> ViewportPlan {
         let focus = sheet.merges.anchor_for(focus);
         let top_visible_row = Self::vertical(sheet, viewport, focus, freeze);
-        let left_col = Self::horizontal(sheet, viewport, focus, freeze);
+        let left_col = Self::horizontal(sheet, viewport, focus, freeze, widths);
         ViewportPlan {
             top_visible_row,
             left_col,
@@ -119,6 +120,7 @@ impl ViewportPlanner {
         viewport: &Viewport,
         focus: CellAddr,
         freeze: EffectiveFreeze,
+        widths: &ColumnWidths,
     ) -> u32 {
         let used_end = sheet.used_range.end.col;
         let frozen_cols = freeze.cols.min(used_end.saturating_add(1));
@@ -140,27 +142,28 @@ impl ViewportPlanner {
             left = frozen_cols;
         }
         let frozen_width: u32 = (0..frozen_cols)
-            .map(|col| slot_width(sheet, col) as u32)
+            .map(|col| slot_width(widths, col) as u32)
             .sum();
         let available = (viewport.width as u32)
             .saturating_sub(frozen_width.min(viewport.width as u32))
             .max(1);
-        let mut width = Self::range_width(sheet, left, span_end);
+        let mut width = Self::range_width(widths, left, span_end);
         while left < span_start && width > available {
-            width = width.saturating_sub(slot_width(sheet, left) as u32);
+            width = width.saturating_sub(slot_width(widths, left) as u32);
             left += 1;
         }
         left.min(used_end)
     }
 
-    fn range_width(sheet: &Sheet, start: u32, end: u32) -> u32 {
-        (start..=end).map(|col| slot_width(sheet, col) as u32).sum()
+    fn range_width(widths: &ColumnWidths, start: u32, end: u32) -> u32 {
+        (start..=end)
+            .map(|col| slot_width(widths, col) as u32)
+            .sum()
     }
 }
 
-fn slot_width(sheet: &Sheet, col: u32) -> u16 {
-    let limits = sheet.layout_limits;
-    column_width(&sheet.layout, col, &limits).saturating_add(CELL_GUTTER)
+fn slot_width(widths: &ColumnWidths, col: u32) -> u16 {
+    widths.width(col).saturating_add(CELL_GUTTER)
 }
 
 fn row_height(sheet: &Sheet, row: u32) -> u32 {
@@ -171,13 +174,4 @@ fn row_height(sheet: &Sheet, row: u32) -> u32 {
         .copied()
         .unwrap_or(1)
         .max(1) as u32
-}
-
-fn column_width(layout: &LayoutSnapshot, col: u32, limits: &LayoutLimits) -> u16 {
-    layout
-        .column_widths
-        .get(col as usize)
-        .copied()
-        .unwrap_or(limits.default_col_width)
-        .max(1)
 }
