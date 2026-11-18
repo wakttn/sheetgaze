@@ -658,6 +658,7 @@ impl AppState {
         if let Some(workbook) = &mut self.workbook {
             for sheet in &mut workbook.sheets {
                 sheet.normalize_after_structural_save();
+                sheet.formula_rewrites.clear();
             }
         }
         self.edit_log.reset_after_save();
@@ -1831,6 +1832,7 @@ impl AppState {
         match self.apply_structure_op(StructureOp::insert(Axis::Row, index, count)) {
             Ok(_) => {
                 self.focus.row = index.min(self.active_meta_rows().saturating_sub(1));
+                self.selection = None;
                 self.mode = Mode::Normal;
                 self.status_message = Some(format!("inserted {count} row(s)"));
                 if enter_insert {
@@ -1858,6 +1860,7 @@ impl AppState {
         match self.apply_structure_op(StructureOp::insert(Axis::Column, index, count)) {
             Ok(_) => {
                 self.focus.col = index.min(self.active_meta_cols().saturating_sub(1));
+                self.selection = None;
                 self.mode = Mode::Normal;
                 self.status_message = Some(format!("inserted {count} column(s)"));
                 if enter_insert {

@@ -362,6 +362,13 @@ fn insert_rows(sheet: &mut Sheet, index: u32, count: u32) {
     }
     shift_data_rows_insert(&mut sheet.data_rows, index, count);
     shift_layout_rows_insert(&mut sheet.layout, index, count);
+    shift_merge_borders(
+        &mut sheet.merge_borders,
+        Axis::Row,
+        StructureMode::Insert,
+        index,
+        count,
+    );
     shift_merges(
         &mut sheet.merges,
         Axis::Row,
@@ -443,6 +450,13 @@ fn delete_rows(sheet: &mut Sheet, index: u32, count: u32) -> RemovedCells {
     }
     shift_data_rows_delete(&mut sheet.data_rows, index, count);
     shift_layout_rows_delete(&mut sheet.layout, index, count);
+    shift_merge_borders(
+        &mut sheet.merge_borders,
+        Axis::Row,
+        StructureMode::Delete,
+        index,
+        count,
+    );
     shift_merges(
         &mut sheet.merges,
         Axis::Row,
@@ -471,8 +485,7 @@ fn delete_rows(sheet: &mut Sheet, index: u32, count: u32) -> RemovedCells {
         .formula_cells
         .retain(|addr| !(addr.row >= index && addr.row < end));
     shift_formula_cells(&mut sheet.formula_cells, Axis::Row, index, count, false);
-    sheet.formula_rewrites =
-        shift_rewrites(&sheet.formula_rewrites, Axis::Row, index, count, false);
+    shift_rewrites_after_delete(sheet, Axis::Row, index, count);
     sheet.invalidate_filter_masks();
     removed
 }
@@ -486,6 +499,13 @@ fn insert_cols(sheet: &mut Sheet, index: u32, count: u32) {
         sheet.used_range.end.col = sheet.used_range.end.col.saturating_add(count);
     }
     shift_layout_cols_insert(&mut sheet.layout, index, count);
+    shift_merge_borders(
+        &mut sheet.merge_borders,
+        Axis::Column,
+        StructureMode::Insert,
+        index,
+        count,
+    );
     shift_merges(
         &mut sheet.merges,
         Axis::Column,
@@ -573,6 +593,13 @@ fn delete_cols(sheet: &mut Sheet, index: u32, count: u32) -> RemovedCells {
             .min(sheet.meta.column_count.saturating_sub(1));
     }
     shift_layout_cols_delete(&mut sheet.layout, index, count);
+    shift_merge_borders(
+        &mut sheet.merge_borders,
+        Axis::Column,
+        StructureMode::Delete,
+        index,
+        count,
+    );
     shift_merges(
         &mut sheet.merges,
         Axis::Column,
@@ -602,8 +629,7 @@ fn delete_cols(sheet: &mut Sheet, index: u32, count: u32) -> RemovedCells {
         .formula_cells
         .retain(|addr| !(addr.col >= index && addr.col < end));
     shift_formula_cells(&mut sheet.formula_cells, Axis::Column, index, count, false);
-    sheet.formula_rewrites =
-        shift_rewrites(&sheet.formula_rewrites, Axis::Column, index, count, false);
+    shift_rewrites_after_delete(sheet, Axis::Column, index, count);
     sheet.invalidate_filter_masks();
     removed
 }
@@ -800,6 +826,42 @@ fn shift_layout_cols_delete(layout: &mut LayoutSnapshot, index: u32, count: u32)
                 Some(*col)
             }
         })
+        .collect();
+}
+
+fn shift_merge_borders(
+    borders: &mut HashMap<CellAddr, CellBorders>,
+    axis: Axis,
+    mode: StructureMode,
+    index: u32,
+    count: u32,
+) {
+    let end = index.saturating_add(count);
+    let old = std::mem::take(borders);
+    for (addr, border) in old {
+        let deleted = mode == StructureMode::Delete
+            && match axis {
+                Axis::Row => addr.row >= index && addr.row < end,
+                Axis::Column => addr.col >= index && addr.col < end,
+            };
+        if deleted {
+            continue;
+        }
+        let new_addr = shift_addr(addr, axis, index, count, mode == StructureMode::Insert);
+        borders.insert(new_addr, border);
+    }
+}
+
+fn shift_rewrites_after_delete(sheet: &mut Sheet, axis: Axis, index: u32, count: u32) {
+    let end = index.saturating_add(count);
+    let old = std::mem::take(&mut sheet.formula_rewrites);
+    sheet.formula_rewrites = old
+        .into_iter()
+        .filter(|(addr, _)| match axis {
+            Axis::Row => !(addr.row >= index && addr.row < end),
+            Axis::Column => !(addr.col >= index && addr.col < end),
+        })
+        .map(|(addr, value)| (shift_addr(addr, axis, index, count, false), value))
         .collect();
 }
 
