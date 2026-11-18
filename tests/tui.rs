@@ -74,6 +74,47 @@ fn renders_grid_and_status() {
 }
 
 #[test]
+fn non_mono_palette_uses_white_background_and_black_text() {
+    use sheetgaze::ui::screen::SnapshotStyle;
+
+    let path = fixture();
+    let workbook = load_csv(
+        &path,
+        &Default::default(),
+        &LazyConfig {
+            enabled: false,
+            ..LazyConfig::default()
+        },
+        None,
+    )
+    .unwrap();
+    let mut state = AppState::new(workbook, Config::default());
+    state.set_size(40, 10);
+    let view = state.view();
+    let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+    let color_theme = Theme::new(sheetgaze::config::ColorMode::Truecolor);
+    terminal
+        .draw(|frame| Screen::render(frame, &view, &color_theme))
+        .unwrap();
+    let cell = terminal.backend().buffer()[(0, 0)].clone();
+    assert_eq!(cell.bg, Color::White);
+    assert_eq!(cell.fg, Color::Black);
+
+    let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+    let mono_theme = Theme::new(sheetgaze::config::ColorMode::Mono);
+    terminal
+        .draw(|frame| Screen::render(frame, &view, &mono_theme))
+        .unwrap();
+    let cell = terminal.backend().buffer()[(0, 0)].clone();
+    assert_eq!(cell.bg, Color::Reset);
+    assert_eq!(cell.fg, Color::Reset);
+
+    let plain_color = Screen::snapshot(&view, &color_theme, 40, 10, SnapshotStyle::Plain).unwrap();
+    let plain_mono = Screen::snapshot(&view, &mono_theme, 40, 10, SnapshotStyle::Plain).unwrap();
+    assert_eq!(plain_color, plain_mono);
+}
+
+#[test]
 fn renders_insert_line_and_dirty_marker() {
     let path = std::env::temp_dir().join("sheetgaze-tests/edit-line.xlsx");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -629,8 +670,8 @@ fn fill_border_mode_draws_a_colored_outline_without_a_background() {
     let text_cell = buffer.cell((6, 2)).unwrap();
     assert_eq!(
         text_cell.bg,
-        Color::Reset,
-        "border mode must not paint the background"
+        Color::White,
+        "border mode must not paint the Excel fill; the non-mono base background remains"
     );
 
     let bottom_border = buffer.cell((7, 2)).unwrap();
@@ -699,8 +740,8 @@ fn fill_background_mode_paints_whole_cell_slots_and_empty_filled_cells() {
         }
         assert_eq!(
             buffer.cell((x + width, y)).unwrap().bg,
-            Color::Reset,
-            "the cell fill must not paint over the cell boundary"
+            Color::White,
+            "the cell fill must not paint over the cell boundary; the base background remains"
         );
     }
 }

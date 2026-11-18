@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::domain::addr::{CellAddr, CellRange};
+use crate::domain::register::PasteSource;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubstituteScope {
@@ -43,6 +44,26 @@ pub enum ExCommand {
         addr: Option<CellAddr>,
     },
     Sheet(String),
+    InsertRows {
+        before: bool,
+        count: u32,
+    },
+    InsertColumns {
+        before: bool,
+        count: u32,
+    },
+    DeleteRows {
+        before: bool,
+        count: u32,
+    },
+    DeleteColumns {
+        before: bool,
+        count: u32,
+    },
+    Put {
+        before: bool,
+        source: PasteSource,
+    },
     Help,
     Unknown(String),
 }
@@ -71,6 +92,9 @@ pub fn parse(input: &str) -> Result<ExCommand, String> {
             return Err("sheet name is required".to_string());
         }
         return Ok(ExCommand::Sheet(unquote(name)));
+    }
+    if let Some(command) = parse_structure(input)? {
+        return Ok(command);
     }
     if let Some(command) = parse_substitute(input)? {
         return Ok(ExCommand::Substitute(command));
@@ -133,6 +157,68 @@ fn unquote(value: &str) -> String {
         .trim_matches('\'')
         .trim_matches('"')
         .to_string()
+}
+
+fn parse_structure(input: &str) -> Result<Option<ExCommand>, String> {
+    if let Some((before, rest)) = strip_command(input, "irow") {
+        return Ok(Some(ExCommand::InsertRows {
+            before,
+            count: parse_count(rest)?,
+        }));
+    }
+    if let Some((before, rest)) = strip_command(input, "icol") {
+        return Ok(Some(ExCommand::InsertColumns {
+            before,
+            count: parse_count(rest)?,
+        }));
+    }
+    if let Some((before, rest)) = strip_command(input, "drow") {
+        return Ok(Some(ExCommand::DeleteRows {
+            before,
+            count: parse_count(rest)?,
+        }));
+    }
+    if let Some((before, rest)) = strip_command(input, "dcol") {
+        return Ok(Some(ExCommand::DeleteColumns {
+            before,
+            count: parse_count(rest)?,
+        }));
+    }
+    if let Some((before, rest)) = strip_command(input, "put") {
+        let source = match rest.trim() {
+            "" => PasteSource::Unnamed,
+            "0" => PasteSource::Yank,
+            "+" => PasteSource::System,
+            other => return Err(format!("unknown register: {other}")),
+        };
+        return Ok(Some(ExCommand::Put { before, source }));
+    }
+    Ok(None)
+}
+
+fn strip_command<'a>(input: &'a str, name: &str) -> Option<(bool, &'a str)> {
+    let rest = input.strip_prefix(name)?;
+    if let Some(rest) = rest.strip_prefix('!') {
+        Some((true, rest))
+    } else if rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace) {
+        Some((false, rest))
+    } else {
+        None
+    }
+}
+
+fn parse_count(rest: &str) -> Result<u32, String> {
+    let value = rest.trim();
+    if value.is_empty() {
+        return Ok(1);
+    }
+    let count = value
+        .parse::<u32>()
+        .map_err(|_| format!("invalid count: {value}"))?;
+    if !(1..=1000).contains(&count) {
+        return Err("count must be between 1 and 1000".to_string());
+    }
+    Ok(count)
 }
 
 fn parse_substitute(input: &str) -> Result<Option<SubstituteCommand>, String> {
@@ -330,6 +416,41 @@ mod tests {
                 CellAddr::from_a1("C3").unwrap()
             ))
         );
+    }
+
+    #[test]
+    fn parses_structural_commands() {
+        assert_eq!(
+            parse("irow 2").unwrap(),
+            ExCommand::InsertRows {
+                before: false,
+                count: 2
+            }
+        );
+        assert_eq!(
+            parse("irow!").unwrap(),
+            ExCommand::InsertRows {
+                before: true,
+                count: 1
+            }
+        );
+        assert_eq!(
+            parse("dcol! 3").unwrap(),
+            ExCommand::DeleteColumns {
+                before: true,
+                count: 3
+            }
+        );
+        assert_eq!(
+            parse("put +").unwrap(),
+            ExCommand::Put {
+                before: false,
+                source: PasteSource::System
+            }
+        );
+        assert!(parse("irow 0").is_err());
+        assert!(parse("irow 1001").is_err());
+        assert!(parse("put x").is_err());
     }
 
     #[test]

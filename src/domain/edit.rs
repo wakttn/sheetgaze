@@ -1,7 +1,10 @@
 use crate::domain::addr::CellAddr;
 use crate::domain::cell::{Cell, CellValue};
 use crate::domain::formula::{FormulaInfo, FormulaStatus};
-use crate::domain::sheet::Sheet;
+use crate::domain::sheet::{Sheet, SheetData};
+use crate::domain::structure::{
+    FormulaChange, RemovedCells, StructureEngine, StructureOp, StructureSnapshot,
+};
 use crate::domain::style::CellStyle;
 use crate::domain::workbook::WorkbookModel;
 
@@ -40,24 +43,66 @@ impl EditChange {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct StructureEdit {
+    pub sheet: usize,
+    pub op: StructureOp,
+    pub removed: RemovedCells,
+    pub before: StructureSnapshot,
+    pub after: StructureSnapshot,
+    pub formula_before: Vec<FormulaChange>,
+    pub formula_after: Vec<FormulaChange>,
+}
+
+#[derive(Clone, Debug)]
+pub enum EditOp {
+    Cell(Box<EditChange>),
+    Structure(Box<StructureEdit>),
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct EditTransaction {
-    pub changes: Vec<EditChange>,
+    pub ops: Vec<EditOp>,
 }
 
 impl EditTransaction {
     pub fn single(change: EditChange) -> Self {
         Self {
-            changes: vec![change],
+            ops: vec![EditOp::Cell(Box::new(change))],
         }
     }
 
+    pub fn from_ops(ops: Vec<EditOp>) -> Self {
+        Self { ops }
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.changes.is_empty()
+        self.ops.is_empty()
     }
 
     pub fn cell_count(&self) -> usize {
-        self.changes.len()
+        self.ops
+            .iter()
+            .filter(|op| matches!(op, EditOp::Cell(_)))
+            .count()
+    }
+
+    pub fn structure_count(&self) -> usize {
+        self.ops
+            .iter()
+            .filter(|op| matches!(op, EditOp::Structure(_)))
+            .count()
+    }
+
+    pub fn summary(&self) -> String {
+        let cells = self.cell_count();
+        let structures = self.structure_count();
+        match (cells, structures) {
+            (0, 0) => "no changes".to_string(),
+            (cells, 0) => format!("{cells} cells"),
+            (0, structures) => format!("{structures} structure operations"),
+            (cells, structures) => format!("{cells} cells, {structures} structure operations"),
+        }
     }
 }
 
@@ -143,20 +188,102 @@ impl EditLog {
 }
 
 pub fn apply_changes(workbook: &mut WorkbookModel, transaction: &EditTransaction, forward: bool) {
-    let changes: Box<dyn Iterator<Item = &EditChange>> = if forward {
-        Box::new(transaction.changes.iter())
+    let ops: Box<dyn Iterator<Item = &EditOp>> = if forward {
+        Box::new(transaction.ops.iter())
     } else {
-        Box::new(transaction.changes.iter().rev())
+        Box::new(transaction.ops.iter().rev())
     };
+    for op in ops {
+        match op {
+            EditOp::Cell(change) => {
+                let target = if forward {
+                    change.after.clone()
+                } else {
+                    change.before.clone()
+                };
+                if let Some(sheet) = workbook.sheets.get_mut(change.sheet) {
+                    sheet.set_edit_cell(change.addr, target);
+                }
+            }
+            EditOp::Structure(edit) => {
+                if forward {
+                    if let Some(sheet) = workbook.sheets.get_mut(edit.sheet) {
+                        let _ = StructureEngine::apply(sheet, edit.op);
+                        restore_snapshot(sheet, &edit.after);
+                    }
+                    apply_formula_changes(workbook, &edit.formula_after, true);
+                } else {
+                    if let Some(sheet) = workbook.sheets.get_mut(edit.sheet) {
+                        StructureEngine::invert(sheet, edit.op, &edit.removed);
+                        restore_snapshot(sheet, &edit.before);
+                    }
+                    apply_formula_changes(workbook, &edit.formula_before, false);
+                }
+            }
+        }
+    }
+}
+
+fn restore_snapshot(sheet: &mut Sheet, snapshot: &StructureSnapshot) {
+    sheet.origin_rows = snapshot.origin_rows.clone();
+    sheet.origin_cols = snapshot.origin_cols.clone();
+    sheet.merges = crate::domain::merge::MergeIndex::new(snapshot.merges.clone());
+    sheet.merge_borders = snapshot.merge_borders.clone();
+    sheet.filters = snapshot.filters.clone();
+    sheet.filter_state = snapshot.filter_state.clone();
+    sheet.layout = snapshot.layout.clone();
+    sheet.freeze = snapshot.freeze;
+    sheet.conditional_formats = snapshot.conditional_formats.clone();
+    sheet.used_range = snapshot.used_range;
+    sheet.meta = snapshot.meta;
+    sheet.data_rows = snapshot.data_rows;
+    sheet.formula_cells = snapshot.formula_cells.clone();
+    sheet.formula_overlay.values = snapshot.formula_overlay.iter().cloned().collect();
+    sheet.formula_rewrites = snapshot.formula_rewrites.clone();
+    sheet.structural_dirty = true;
+    let _ = sheet.rebuild_visibility();
+}
+
+fn apply_formula_changes(workbook: &mut WorkbookModel, changes: &[FormulaChange], forward: bool) {
     for change in changes {
-        let target = if forward {
+        let value = if forward {
             change.after.clone()
         } else {
             change.before.clone()
         };
         if let Some(sheet) = workbook.sheets.get_mut(change.sheet) {
-            sheet.set_edit_cell(change.addr, target);
+            match value {
+                Some(expression) => {
+                    if let Some(cell) = sheet.edits.get_mut(&change.addr) {
+                        set_formula_expression(cell, expression.clone());
+                    } else if let SheetData::Eager(cells) = &mut sheet.data
+                        && let Some(cell) = cells.get_mut(&change.addr)
+                    {
+                        set_formula_expression(cell, expression.clone());
+                    }
+                    sheet.formula_rewrites.insert(change.addr, expression);
+                }
+                None => {
+                    if let Some(cell) = sheet.edits.get_mut(&change.addr) {
+                        cell.formula = None;
+                    } else if let SheetData::Eager(cells) = &mut sheet.data
+                        && let Some(cell) = cells.get_mut(&change.addr)
+                    {
+                        cell.formula = None;
+                    }
+                    sheet.formula_rewrites.remove(&change.addr);
+                }
+            }
         }
+    }
+}
+
+fn set_formula_expression(cell: &mut Cell, expression: String) {
+    if let Some(formula) = cell.formula.as_mut() {
+        formula.expression = expression;
+        formula.status = FormulaStatus::Pending;
+    } else {
+        cell.formula = Some(FormulaInfo::new(expression, None));
     }
 }
 

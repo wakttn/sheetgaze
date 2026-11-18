@@ -11,7 +11,10 @@ use crate::domain::addr::CellAddr;
 use crate::domain::cell::{Cell, CellValue};
 use crate::domain::error::SaveError;
 use crate::domain::formula::FormulaInfo;
+use crate::domain::sheet::{Sheet, SheetData};
+use crate::domain::structure::OriginMap;
 use crate::domain::workbook::{SourceFormat, WorkbookModel};
+use crate::io::formula_ref::{FormulaContext, FormulaRefEngine, RewriteStatus};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SaveOutcome {
@@ -27,7 +30,12 @@ pub fn save_workbook(workbook: &WorkbookModel) -> Result<SaveOutcome, SaveError>
     let edited: Vec<&crate::domain::sheet::Sheet> = workbook
         .sheets
         .iter()
-        .filter(|sheet| !sheet.edits.is_empty())
+        .filter(|sheet| {
+            sheet.structural_dirty
+                || !sheet.edits.is_empty()
+                || !sheet.formula_overlay.values.is_empty()
+                || !sheet.formula_rewrites.is_empty()
+        })
         .collect();
     if edited.is_empty() {
         return Err(SaveError::NoChanges);
@@ -94,6 +102,14 @@ fn write_patched_zip(workbook: &WorkbookModel, output: &mut File) -> Result<(), 
     let mut archive = ZipArchive::new(source).map_err(|error| SaveError::Zip(error.to_string()))?;
     let sheet_paths = sheet_paths(&mut archive)?;
     let mut replacements: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut transforms = BTreeMap::new();
+    for sheet in &workbook.sheets {
+        if sheet.structural_dirty {
+            transforms.insert(sheet.name.clone(), OriginMap::from_sheet(sheet));
+        }
+    }
+    let formula_context = FormulaContext { transforms };
+    let has_transforms = !formula_context.transforms.is_empty();
 
     for sheet in &workbook.sheets {
         let cache: HashMap<CellAddr, CellValue> = sheet
@@ -102,7 +118,14 @@ fn write_patched_zip(workbook: &WorkbookModel, output: &mut File) -> Result<(), 
             .iter()
             .map(|(addr, result)| (*addr, result.value.clone()))
             .collect();
-        if sheet.edits.is_empty() && cache.is_empty() {
+        let needs_context_rewrite =
+            has_transforms && !sheet.structural_dirty && matches!(sheet.data, SheetData::Lazy(_));
+        if !sheet.structural_dirty
+            && sheet.edits.is_empty()
+            && cache.is_empty()
+            && sheet.formula_rewrites.is_empty()
+            && !needs_context_rewrite
+        {
             continue;
         }
         let Some(path) = sheet_paths.get(&sheet.name).cloned() else {
@@ -114,23 +137,34 @@ fn write_patched_zip(workbook: &WorkbookModel, output: &mut File) -> Result<(), 
         let xml = read_entry(&mut archive, &path)?;
         let xml = String::from_utf8(xml)
             .map_err(|error| SaveError::Xml(format!("worksheet XML is not UTF-8: {error}")))?;
-        let patched = patch_sheet_xml(
-            &xml,
-            &sheet.edits,
-            &cache,
-            sheet.name.as_str(),
-            sheet.used_range.end,
-        )?;
+        let mut patched = if sheet.structural_dirty {
+            patch_sheet_xml_structural(&xml, sheet, &cache)?
+        } else {
+            patch_sheet_xml(
+                &xml,
+                &sheet.edits,
+                &cache,
+                &sheet.formula_rewrites,
+                sheet.name.as_str(),
+                sheet.used_range.end,
+            )?
+        };
+        if needs_context_rewrite {
+            patched = patch_formula_tags_with_context(&patched, &sheet.name, &formula_context)?;
+        }
         replacements.insert(path, patched.into_bytes());
     }
 
     let workbook_xml = read_entry(&mut archive, "xl/workbook.xml")?;
     let workbook_xml = String::from_utf8(workbook_xml)
         .map_err(|error| SaveError::Xml(format!("workbook XML is not UTF-8: {error}")))?;
-    replacements.insert(
-        "xl/workbook.xml".to_string(),
-        patch_calc_pr(&workbook_xml).into_bytes(),
-    );
+    let workbook_xml = patch_calc_pr(&workbook_xml);
+    let workbook_xml = if has_transforms {
+        patch_defined_names(&workbook_xml, &formula_context)?
+    } else {
+        workbook_xml
+    };
+    replacements.insert("xl/workbook.xml".to_string(), workbook_xml.into_bytes());
 
     if let Ok(content_types) = read_entry(&mut archive, "[Content_Types].xml") {
         let text = String::from_utf8_lossy(&content_types);
@@ -325,6 +359,7 @@ fn patch_sheet_xml(
     xml: &str,
     edits: &HashMap<CellAddr, Cell>,
     cache: &HashMap<CellAddr, CellValue>,
+    formula_rewrites: &BTreeMap<CellAddr, String>,
     sheet_name: &str,
     used_end: CellAddr,
 ) -> Result<String, SaveError> {
@@ -379,7 +414,13 @@ fn patch_sheet_xml(
             .filter(|(addr, _)| addr.row == row_number)
             .map(|(addr, value)| (addr.col, value))
             .collect();
-        new_content.push_str(&patch_row(&row, &row_edits, &row_cache, sheet_name)?);
+        new_content.push_str(&patch_row(
+            &row,
+            &row_edits,
+            &row_cache,
+            formula_rewrites,
+            sheet_name,
+        )?);
         new_content.push('\n');
     }
 
@@ -397,6 +438,498 @@ fn patch_sheet_xml(
     result.push_str(&xml[close_end..]);
     result = patch_dimension(result, used_end);
     Ok(result)
+}
+
+fn patch_sheet_xml_structural(
+    xml: &str,
+    sheet: &Sheet,
+    cache: &HashMap<CellAddr, CellValue>,
+) -> Result<String, SaveError> {
+    let sheet_name = sheet.name.as_str();
+    if xml.contains("<tableParts")
+        || xml.contains("t=\"shared\"")
+        || xml.contains("t='shared'")
+        || xml.contains("t=\"array\"")
+        || xml.contains("t='array'")
+    {
+        return Err(SaveError::UnsupportedStructure {
+            sheet: sheet_name.to_string(),
+            message:
+                "shared formulas, array formulas, and table parts cannot be structurally saved yet"
+                    .to_string(),
+        });
+    }
+
+    let Some(sheet_data) = find_open_tag(xml, 0, "sheetData") else {
+        return Err(SaveError::Xml(format!("sheetData missing in {sheet_name}")));
+    };
+    let (content_start, content_end, close_tag, close_end) = if sheet_data.self_closing {
+        (
+            sheet_data.end,
+            sheet_data.end,
+            "</sheetData>",
+            sheet_data.end,
+        )
+    } else {
+        let Some(close) = find_close_tag(xml, sheet_data.end, "sheetData") else {
+            return Err(SaveError::Xml(format!(
+                "sheetData is not closed in {sheet_name}"
+            )));
+        };
+        (
+            sheet_data.end,
+            close.start,
+            &xml[close.start..close.end],
+            close.end,
+        )
+    };
+    let content = &xml[content_start..content_end];
+    let empty_edits = HashMap::new();
+    let rows = parse_rows(content, &empty_edits, sheet_name)?;
+    let by_original_row: BTreeMap<u32, RowSpan> =
+        rows.into_iter().map(|row| (row.row, row)).collect();
+    let mut original_to_current_row = HashMap::new();
+    let mut current_to_original_row = HashMap::new();
+    for (current, original) in sheet.origin_rows.iter().enumerate() {
+        if let Some(original) = original {
+            original_to_current_row.insert(*original, current as u32);
+            current_to_original_row.insert(current as u32, *original);
+        }
+    }
+    let mut original_to_current_col = HashMap::new();
+    let mut current_to_original_col = HashMap::new();
+    for (current, original) in sheet.origin_cols.iter().enumerate() {
+        if let Some(original) = original {
+            original_to_current_col.insert(*original, current as u32);
+            current_to_original_col.insert(current as u32, *original);
+        }
+    }
+    let _ = original_to_current_row;
+
+    let mut new_content = String::new();
+    for current_row in 0..sheet.meta.row_count {
+        let original_row = current_to_original_row.get(&current_row).copied();
+        let row_span = original_row.and_then(|row| by_original_row.get(&row));
+        let mut cells: BTreeMap<u32, String> = BTreeMap::new();
+        if let Some(row) = row_span {
+            for cell in &row.cells {
+                let Some(current_col) = original_to_current_col.get(&cell.col).copied() else {
+                    continue;
+                };
+                let addr = CellAddr::new(current_row, current_col);
+                cells.insert(current_col, structural_cell_xml(sheet, cache, addr, cell));
+            }
+        }
+        for (addr, edited) in sheet
+            .edits
+            .iter()
+            .filter(|(addr, _)| addr.row == current_row)
+        {
+            if cells.contains_key(&addr.col) {
+                continue;
+            }
+            let original_tag = current_to_original_col
+                .get(&addr.col)
+                .and_then(|original_col| {
+                    row_span.and_then(|row| {
+                        row.cells
+                            .iter()
+                            .find(|cell| cell.col == *original_col)
+                            .map(|cell| cell.open_tag.as_str())
+                    })
+                });
+            cells.insert(addr.col, render_cell(*addr, edited, original_tag));
+        }
+        let open_tag = match row_span {
+            Some(row) => set_attribute(&row.open_tag, "r", &(current_row + 1).to_string()),
+            None => format!("<row r=\"{}\">", current_row + 1),
+        };
+        new_content.push_str(&open_tag);
+        for cell in cells.values() {
+            new_content.push_str(cell);
+        }
+        new_content.push_str("</row>");
+        new_content.push('\n');
+    }
+
+    let mut open_tag = xml[sheet_data.start..sheet_data.end].to_string();
+    if sheet_data.self_closing
+        && let Some(pos) = open_tag.rfind('/')
+    {
+        open_tag.remove(pos);
+    }
+    let mut result = String::new();
+    result.push_str(&xml[..sheet_data.start]);
+    result.push_str(&open_tag);
+    result.push_str(&new_content);
+    result.push_str(close_tag);
+    result.push_str(&xml[close_end..]);
+    result = patch_dimension_exact(result, sheet.used_range.end);
+    result = patch_cols(result, sheet);
+    result = patch_merges(result, sheet);
+    result = patch_auto_filter(result, sheet);
+    result = patch_sqref_tags(result, "conditionalFormatting", sheet);
+    result = patch_attr_tag(result, "dataValidation", "sqref", sheet);
+    result = patch_attr_tag(result, "hyperlink", "ref", sheet);
+    result = patch_pane(result, sheet);
+    Ok(result)
+}
+
+fn structural_cell_xml(
+    sheet: &Sheet,
+    cache: &HashMap<CellAddr, CellValue>,
+    addr: CellAddr,
+    cell: &CellSpan,
+) -> String {
+    if let Some(edited) = sheet.edits.get(&addr) {
+        return render_cell(addr, edited, Some(&cell.open_tag));
+    }
+    let tag_end = find_tag_end(&cell.raw, 0).unwrap_or(cell.raw.len());
+    let mut raw = set_attribute(&cell.raw[..tag_end], "r", &addr.a1()) + &cell.raw[tag_end..];
+    if let Some(expression) = sheet.formula_rewrites.get(&addr) {
+        raw = patch_formula_text(&raw, expression);
+    }
+    if let Some(value) = cache.get(&addr)
+        && let Some(patched) = patch_cached_cell(&raw, value)
+    {
+        raw = patched;
+    }
+    raw
+}
+
+fn set_attribute(tag: &str, name: &str, value: &str) -> String {
+    if let Some((start, end)) = find_attribute_span(tag, name) {
+        let mut output = tag.to_string();
+        output.replace_range(start..end, &format!("{name}=\"{value}\""));
+        return output;
+    }
+    let position = tag
+        .rfind("/>")
+        .or_else(|| tag.rfind('>'))
+        .unwrap_or(tag.len());
+    let insert = if tag[..position].trim_end().ends_with('/') {
+        position.saturating_sub(1)
+    } else {
+        position
+    };
+    let mut output = tag.to_string();
+    output.insert_str(insert, &format!(" {name}=\"{value}\""));
+    output
+}
+
+fn patch_formula_text(raw: &str, expression: &str) -> String {
+    let Some(tag) = find_open_tag(raw, 0, "f") else {
+        return raw.to_string();
+    };
+    let Some(close) = find_close_tag(raw, tag.end, "f") else {
+        return raw.to_string();
+    };
+    let text = xml_escape(expression.trim_start_matches('='));
+    let mut output = String::new();
+    output.push_str(&raw[..tag.end]);
+    output.push_str(&text);
+    output.push_str(&raw[close.start..]);
+    output
+}
+
+fn patch_formula_tags_with_context(
+    xml: &str,
+    sheet_name: &str,
+    context: &FormulaContext,
+) -> Result<String, SaveError> {
+    if xml.contains("t=\"shared\"")
+        || xml.contains("t='shared'")
+        || xml.contains("t=\"array\"")
+        || xml.contains("t='array'")
+    {
+        return Err(SaveError::UnsupportedStructure {
+            sheet: sheet_name.to_string(),
+            message:
+                "shared formulas, array formulas, and table parts cannot be structurally saved yet"
+                    .to_string(),
+        });
+    }
+    let mut result = String::new();
+    let mut position = 0usize;
+    while let Some(tag) = find_open_tag(xml, position, "f") {
+        result.push_str(&xml[position..tag.end]);
+        if tag.self_closing {
+            position = tag.end;
+            continue;
+        }
+        let Some(close) = find_close_tag(xml, tag.end, "f") else {
+            return Err(SaveError::Xml(format!(
+                "formula is not closed in {sheet_name}"
+            )));
+        };
+        let expression = &xml[tag.end..close.start];
+        let candidate = if expression.trim_start().starts_with('=') {
+            expression.to_string()
+        } else {
+            format!("={expression}")
+        };
+        match FormulaRefEngine::rewrite_for_origin(&candidate, context) {
+            RewriteStatus::Unchanged => result.push_str(expression),
+            RewriteStatus::Rewritten(updated) => {
+                result.push_str(&xml_escape(updated.trim_start_matches('=')));
+            }
+            RewriteStatus::Unsupported(message) => {
+                return Err(SaveError::UnsupportedStructure {
+                    sheet: sheet_name.to_string(),
+                    message,
+                });
+            }
+        }
+        result.push_str(&xml[close.start..close.end]);
+        position = close.end;
+    }
+    result.push_str(&xml[position..]);
+    Ok(result)
+}
+
+fn patch_defined_names(xml: &str, context: &FormulaContext) -> Result<String, SaveError> {
+    let mut result = String::new();
+    let mut position = 0usize;
+    while let Some(tag) = find_open_tag(xml, position, "definedName") {
+        result.push_str(&xml[position..tag.end]);
+        if tag.self_closing {
+            position = tag.end;
+            continue;
+        }
+        let Some(close) = find_close_tag(xml, tag.end, "definedName") else {
+            return Err(SaveError::Xml(
+                "definedName tag is not closed in workbook.xml".to_string(),
+            ));
+        };
+        let expression = &xml[tag.end..close.start];
+        let candidate = if expression.trim_start().starts_with('=') {
+            expression.to_string()
+        } else {
+            format!("={expression}")
+        };
+        match FormulaRefEngine::rewrite_defined_name(&candidate, context) {
+            RewriteStatus::Unchanged => result.push_str(expression),
+            RewriteStatus::Rewritten(updated) => {
+                result.push_str(&xml_escape(updated.trim_start_matches('=')));
+            }
+            RewriteStatus::Unsupported(message) => {
+                return Err(SaveError::UnsupportedStructure {
+                    sheet: "(workbook)".to_string(),
+                    message,
+                });
+            }
+        }
+        result.push_str(&xml[close.start..close.end]);
+        position = close.end;
+    }
+    result.push_str(&xml[position..]);
+    Ok(result)
+}
+
+fn patch_dimension_exact(xml: String, used_end: CellAddr) -> String {
+    if let Some(tag) = find_open_tag(&xml, 0, "dimension") {
+        let replacement = format!("<dimension ref=\"A1:{}\"/>", used_end.a1());
+        let mut result = String::new();
+        result.push_str(&xml[..tag.start]);
+        result.push_str(&replacement);
+        result.push_str(&xml[tag.end..]);
+        return result;
+    }
+    if let Some(sheet_data) = find_open_tag(&xml, 0, "sheetData") {
+        let insertion = format!("<dimension ref=\"A1:{}\"/>", used_end.a1());
+        let mut result = String::new();
+        result.push_str(&xml[..sheet_data.start]);
+        result.push_str(&insertion);
+        result.push_str(&xml[sheet_data.start..]);
+        return result;
+    }
+    xml
+}
+
+fn patch_cols(xml: String, sheet: &Sheet) -> String {
+    let Some(open) = find_open_tag(&xml, 0, "cols") else {
+        return xml;
+    };
+    if open.self_closing {
+        return xml;
+    }
+    let Some(close) = find_close_tag(&xml, open.end, "cols") else {
+        return xml;
+    };
+    let content = &xml[open.end..close.start];
+    let mut output = String::new();
+    let mut position = 0usize;
+    while let Some(tag) = find_open_tag(content, position, "col") {
+        let raw = &content[tag.start..tag.end];
+        let min = attribute(raw, "min").and_then(|value| value.parse::<u32>().ok());
+        let max = attribute(raw, "max").and_then(|value| value.parse::<u32>().ok());
+        if let (Some(min), Some(max)) = (min, max) {
+            for original in min.saturating_sub(1)..max {
+                let Some(current) = sheet
+                    .origin_cols
+                    .iter()
+                    .position(|value| *value == Some(original))
+                else {
+                    continue;
+                };
+                let mut column = set_attribute(raw, "min", &(current + 1).to_string());
+                column = set_attribute(&column, "max", &(current + 1).to_string());
+                output.push_str(&column);
+            }
+        }
+        position = tag.end;
+    }
+    let mut result = String::new();
+    result.push_str(&xml[..open.end]);
+    result.push_str(&output);
+    result.push_str(&xml[close.start..]);
+    result
+}
+
+fn patch_merges(xml: String, sheet: &Sheet) -> String {
+    let Some(open) = find_open_tag(&xml, 0, "mergeCells") else {
+        return xml;
+    };
+    if open.self_closing {
+        return xml;
+    }
+    let Some(close) = find_close_tag(&xml, open.end, "mergeCells") else {
+        return xml;
+    };
+    let origin = OriginMap::from_sheet(sheet);
+    let content = &xml[open.end..close.start];
+    let mut output = String::new();
+    let mut count = 0usize;
+    let mut position = 0usize;
+    while let Some(tag) = find_open_tag(content, position, "mergeCell") {
+        let raw = &content[tag.start..tag.end];
+        if let Some(reference) = attribute(raw, "ref")
+            && let Some(range) = parse_range(&reference)
+            && let Some(mapped) = origin.transform_range(range)
+        {
+            output.push_str(&format!(
+                "<mergeCell ref=\"{}:{}\"/>",
+                mapped.start.a1(),
+                mapped.end.a1()
+            ));
+            count += 1;
+        }
+        position = tag.end;
+    }
+    let open_tag = set_attribute(&xml[open.start..open.end], "count", &count.to_string());
+    let mut result = String::new();
+    result.push_str(&xml[..open.start]);
+    result.push_str(&open_tag);
+    result.push_str(&output);
+    result.push_str(&xml[close.start..]);
+    result
+}
+
+fn patch_auto_filter(xml: String, sheet: &Sheet) -> String {
+    let Some(tag) = find_open_tag(&xml, 0, "autoFilter") else {
+        return xml;
+    };
+    let origin = OriginMap::from_sheet(sheet);
+    let raw = &xml[tag.start..tag.end];
+    let Some(reference) = attribute(raw, "ref") else {
+        return xml;
+    };
+    let Some(range) = parse_range(&reference) else {
+        return xml;
+    };
+    let Some(mapped) = origin.transform_range(range) else {
+        return xml;
+    };
+    let patched = set_attribute(
+        raw,
+        "ref",
+        &format!("{}:{}", mapped.start.a1(), mapped.end.a1()),
+    );
+    let mut result = String::new();
+    result.push_str(&xml[..tag.start]);
+    result.push_str(&patched);
+    result.push_str(&xml[tag.end..]);
+    result
+}
+
+fn patch_sqref_tags(xml: String, tag_name: &str, sheet: &Sheet) -> String {
+    let origin = OriginMap::from_sheet(sheet);
+    let mut result = String::new();
+    let mut position = 0usize;
+    while let Some(tag) = find_open_tag(&xml, position, tag_name) {
+        result.push_str(&xml[position..tag.start]);
+        let raw = &xml[tag.start..tag.end];
+        if let Some(value) = attribute(raw, "sqref") {
+            let mapped = value
+                .split_whitespace()
+                .filter_map(parse_range)
+                .filter_map(|range| origin.transform_range(range))
+                .map(|range| format!("{}:{}", range.start.a1(), range.end.a1()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            result.push_str(&set_attribute(raw, "sqref", &mapped));
+        } else {
+            result.push_str(raw);
+        }
+        position = tag.end;
+    }
+    result.push_str(&xml[position..]);
+    result
+}
+
+fn patch_attr_tag(xml: String, tag_name: &str, attr: &str, sheet: &Sheet) -> String {
+    let origin = OriginMap::from_sheet(sheet);
+    let mut result = String::new();
+    let mut position = 0usize;
+    while let Some(tag) = find_open_tag(&xml, position, tag_name) {
+        result.push_str(&xml[position..tag.start]);
+        let raw = &xml[tag.start..tag.end];
+        if let Some(value) = attribute(raw, attr) {
+            let mapped = value
+                .split_whitespace()
+                .filter_map(parse_range)
+                .filter_map(|range| origin.transform_range(range))
+                .map(|range| format!("{}:{}", range.start.a1(), range.end.a1()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            result.push_str(&set_attribute(raw, attr, &mapped));
+        } else {
+            result.push_str(raw);
+        }
+        position = tag.end;
+    }
+    result.push_str(&xml[position..]);
+    result
+}
+
+fn patch_pane(xml: String, sheet: &Sheet) -> String {
+    let Some(tag) = find_open_tag(&xml, 0, "pane") else {
+        return xml;
+    };
+    if !sheet.freeze.is_active() {
+        return xml;
+    }
+    let raw = &xml[tag.start..tag.end];
+    let mut patched = set_attribute(raw, "ySplit", &sheet.freeze.frozen_rows.to_string());
+    patched = set_attribute(&patched, "xSplit", &sheet.freeze.frozen_cols.to_string());
+    patched = set_attribute(
+        &patched,
+        "topLeftCell",
+        &CellAddr::new(sheet.freeze.frozen_rows, sheet.freeze.frozen_cols).a1(),
+    );
+    let mut result = String::new();
+    result.push_str(&xml[..tag.start]);
+    result.push_str(&patched);
+    result.push_str(&xml[tag.end..]);
+    result
+}
+
+fn parse_range(value: &str) -> Option<crate::domain::addr::CellRange> {
+    let (start, end) = value.split_once(':')?;
+    Some(crate::domain::addr::CellRange::new(
+        CellAddr::from_a1(start)?,
+        CellAddr::from_a1(end)?,
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -504,9 +1037,10 @@ fn patch_row(
     row: &RowSpan,
     edits: &BTreeMap<u32, &Cell>,
     cache: &BTreeMap<u32, &CellValue>,
+    formula_rewrites: &BTreeMap<CellAddr, String>,
     sheet_name: &str,
 ) -> Result<String, SaveError> {
-    if edits.is_empty() && cache.is_empty() {
+    if edits.is_empty() && cache.is_empty() && formula_rewrites.is_empty() {
         return Ok(format!("{}{}{}", row.open_tag, row.inner, row.close_tag));
     }
     let mut cells: BTreeMap<u32, String> = row
@@ -514,6 +1048,16 @@ fn patch_row(
         .iter()
         .map(|cell| (cell.col, cell.raw.clone()))
         .collect();
+    for cell in &row.cells {
+        if edits.contains_key(&cell.col) {
+            continue;
+        }
+        if let Some(expression) = formula_rewrites.get(&cell.addr)
+            && let Some(raw) = cells.get(&cell.col)
+        {
+            cells.insert(cell.col, patch_formula_text(raw, expression));
+        }
+    }
     for (col, edited) in edits {
         let (addr, original_tag) = row
             .cells
@@ -1056,8 +1600,15 @@ mod tests {
             CellAddr::new(0, 0),
             Cell::new_with_format(CellValue::Number(42.0), Default::default(), None),
         );
-        let patched =
-            patch_sheet_xml(xml, &edits, &HashMap::new(), "Sheet1", CellAddr::new(0, 1)).unwrap();
+        let patched = patch_sheet_xml(
+            xml,
+            &edits,
+            &HashMap::new(),
+            &BTreeMap::new(),
+            "Sheet1",
+            CellAddr::new(0, 1),
+        )
+        .unwrap();
         assert!(patched.contains("<v>42</v>"));
         assert!(patched.contains("dimension"));
     }
@@ -1074,8 +1625,15 @@ mod tests {
                 None,
             ),
         );
-        let patched =
-            patch_sheet_xml(xml, &edits, &HashMap::new(), "Sheet1", CellAddr::new(0, 1)).unwrap();
+        let patched = patch_sheet_xml(
+            xml,
+            &edits,
+            &HashMap::new(),
+            &BTreeMap::new(),
+            "Sheet1",
+            CellAddr::new(0, 1),
+        )
+        .unwrap();
         let a = patched.find("r=\"A1\"").unwrap();
         let b = patched.find("r=\"B1\"").unwrap();
         assert!(a < b);
@@ -1110,8 +1668,15 @@ mod tests {
             CellAddr::new(2, 0),
             Cell::new_with_format(CellValue::Number(3.0), Default::default(), None),
         );
-        let patched =
-            patch_sheet_xml(xml, &edits, &HashMap::new(), "Sheet1", CellAddr::new(2, 0)).unwrap();
+        let patched = patch_sheet_xml(
+            xml,
+            &edits,
+            &HashMap::new(),
+            &BTreeMap::new(),
+            "Sheet1",
+            CellAddr::new(2, 0),
+        )
+        .unwrap();
         assert!(patched.contains("<sheetData>"));
         assert!(patched.contains("<row r=\"3\">"));
         assert!(patched.contains("</row>"));

@@ -56,6 +56,7 @@ impl Screen {
                 area.width, area.height
             );
             frame.render_widget(Paragraph::new(message), area);
+            theme.apply_base(frame.buffer_mut(), area);
             return;
         }
         let chunks = if show_tabs {
@@ -105,5 +106,6 @@ impl Screen {
             }
             _ => {}
         }
+        theme.apply_base(frame.buffer_mut(), area);
     }
 }

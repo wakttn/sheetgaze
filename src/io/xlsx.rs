@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::BufReader;
 use std::path::Path;
 
@@ -269,6 +269,7 @@ pub fn load_xlsx_with_mode(
             .get(&sheet_name)
             .map(|meta| meta.conditional_formats.clone())
             .unwrap_or_default();
+        let (origin_rows, origin_cols) = Sheet::identity_origins(max_row + 1, max_col + 1);
         sheets.push(Sheet {
             name: sheet_name,
             meta: SheetMeta {
@@ -279,6 +280,10 @@ pub fn load_xlsx_with_mode(
             data_rows: data_rows.finish(),
             data,
             edits: HashMap::new(),
+            origin_rows,
+            origin_cols,
+            structural_dirty: false,
+            formula_rewrites: BTreeMap::new(),
             merges,
             merge_borders,
             layout,
@@ -530,6 +535,7 @@ fn load_xlsx_lazy(
             .get(&sheet_name)
             .map(|meta| meta.conditional_formats.clone())
             .unwrap_or_default();
+        let (origin_rows, origin_cols) = Sheet::identity_origins(max_row + 1, max_col + 1);
         sheets.push(Sheet {
             name: sheet_name,
             meta: SheetMeta {
@@ -540,6 +546,10 @@ fn load_xlsx_lazy(
             data_rows: data_rows.finish(),
             data: SheetData::Lazy(lazy),
             edits: HashMap::new(),
+            origin_rows,
+            origin_cols,
+            structural_dirty: false,
+            formula_rewrites: BTreeMap::new(),
             merges,
             merge_borders,
             layout,

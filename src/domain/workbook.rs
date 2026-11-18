@@ -115,17 +115,15 @@ impl WorkbookModel {
                 message: "sheet index out of bounds".to_string(),
             });
         };
+        let rows = sheet
+            .meta
+            .row_count
+            .max(sheet.used_range.end.row.saturating_add(1));
         let cols = sheet.used_range.end.col + 1;
-        let range = selection.range(cols);
+        let range = selection.range(rows, cols);
         let edits = sheet.edits.clone();
-        let mut session = CopySession::start(
-            sheet,
-            selection,
-            &sheet.merges,
-            &sheet.visibility,
-            limits,
-            cols,
-        )?;
+        let mut session =
+            CopySession::start(sheet, selection, &sheet.merges, &sheet.visibility, limits)?;
         let overlay = sheet.formula_overlay.clone();
         match &mut sheet.data {
             SheetData::Eager(cells) => {

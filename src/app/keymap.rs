@@ -3,10 +3,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::app::action::{Action, Motion};
 use crate::domain::edit::{EditCommit, EditCursor};
 use crate::domain::mode::Mode;
+use crate::domain::register::PasteSource;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingOperator {
     Delete,
+    Yank,
 }
 
 #[derive(Default)]
@@ -15,6 +17,8 @@ pub struct Keymap {
     pending_operator: Option<PendingOperator>,
     pending_replace: bool,
     pending_z: bool,
+    awaiting_register: bool,
+    next_register: Option<PasteSource>,
 }
 
 impl Keymap {
@@ -65,6 +69,22 @@ impl Keymap {
             };
         }
 
+        if self.awaiting_register {
+            self.awaiting_register = false;
+            self.next_register = match key.code {
+                KeyCode::Char('0') => Some(PasteSource::Yank),
+                KeyCode::Char('+') => Some(PasteSource::System),
+                KeyCode::Char('"') => Some(PasteSource::Unnamed),
+                KeyCode::Esc => None,
+                _ => None,
+            };
+            return None;
+        }
+        if key.code == KeyCode::Char('"') && !key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.awaiting_register = true;
+            return None;
+        }
+
         if self.pending_replace {
             self.pending_replace = false;
             return match key.code {
@@ -94,10 +114,17 @@ impl Keymap {
             if operator == PendingOperator::Delete {
                 self.pending_operator = None;
                 if key.code == KeyCode::Char('d') {
-                    return Some(Action::ClearRow);
+                    return Some(Action::CutRow);
                 }
                 if let Some(motion) = motion_for_key(key) {
-                    return Some(Action::ClearMotion(motion));
+                    return Some(Action::CutMotion(motion));
+                }
+                return None;
+            }
+            if operator == PendingOperator::Yank {
+                self.pending_operator = None;
+                if key.code == KeyCode::Char('y') {
+                    return Some(Action::YankRow);
                 }
                 return None;
             }
@@ -105,7 +132,11 @@ impl Keymap {
         if self.pending_g
             && !matches!(
                 key.code,
-                KeyCode::Char('g') | KeyCode::Char('t') | KeyCode::Char('T')
+                KeyCode::Char('g')
+                    | KeyCode::Char('t')
+                    | KeyCode::Char('T')
+                    | KeyCode::Char('i')
+                    | KeyCode::Char('A')
             )
         {
             self.pending_g = false;
@@ -122,6 +153,7 @@ impl Keymap {
                 }
                 KeyCode::Char('o') => return Some(Action::JumpBack),
                 KeyCode::Char('i') => return Some(Action::JumpForward),
+                KeyCode::Char('v') => return Some(Action::ToggleBlockVisual),
                 KeyCode::Tab => return Some(Action::JumpForward),
                 KeyCode::Char('d') => return Some(Action::Move(Motion::HalfDown)),
                 KeyCode::Char('u') => return Some(Action::Move(Motion::HalfUp)),
@@ -151,7 +183,7 @@ impl Keymap {
                 KeyCode::Char('$') | KeyCode::End => Some(Action::Extend(Motion::LineEnd)),
                 KeyCode::Char('^') => Some(Action::Extend(Motion::FirstNonBlank)),
                 KeyCode::Char('y') => Some(Action::Copy),
-                KeyCode::Char('d') | KeyCode::Char('x') => Some(Action::ClearCell),
+                KeyCode::Char('d') | KeyCode::Char('x') => Some(Action::CutSelection),
                 KeyCode::Char('r') => {
                     self.pending_replace = true;
                     None
@@ -191,6 +223,22 @@ impl Keymap {
                 self.pending_g = false;
                 Some(Action::SwitchSheet(-1))
             }
+            KeyCode::Char('i') if self.pending_g => {
+                self.pending_g = false;
+                Some(Action::InsertColumns {
+                    before: true,
+                    enter_insert: true,
+                    count: 1,
+                })
+            }
+            KeyCode::Char('A') if self.pending_g => {
+                self.pending_g = false;
+                Some(Action::InsertColumns {
+                    before: false,
+                    enter_insert: true,
+                    count: 1,
+                })
+            }
             KeyCode::Char('G') => Some(Action::Move(Motion::DataBottom)),
             KeyCode::Char('{') => Some(Action::Move(Motion::Top)),
             KeyCode::Char('}') => Some(Action::Move(Motion::Bottom)),
@@ -201,8 +249,10 @@ impl Keymap {
             KeyCode::PageDown => Some(Action::Move(Motion::PageDown)),
             KeyCode::Char('v') => Some(Action::ToggleVisual),
             KeyCode::Char('V') => Some(Action::ToggleLineVisual),
+            KeyCode::Char('C') => Some(Action::ToggleColumnVisual),
             KeyCode::Char('w') => Some(Action::ToggleFitWidth),
             KeyCode::Char('y') => Some(Action::Copy),
+            KeyCode::Char('Y') => Some(Action::YankRow),
             KeyCode::Enter => Some(Action::OpenDetail),
             KeyCode::Char('K') => Some(Action::OpenDetail),
             KeyCode::Char('/') => Some(Action::SearchOpen),
@@ -218,7 +268,7 @@ impl Keymap {
             KeyCode::Char('A') => Some(Action::EditStart(EditCursor::End)),
             KeyCode::Char('s') => Some(Action::EditClear),
             KeyCode::Char('=') => Some(Action::EditFormula),
-            KeyCode::Char('x') => Some(Action::ClearCell),
+            KeyCode::Char('x') => Some(Action::Cut),
             KeyCode::Char('r') => {
                 self.pending_replace = true;
                 None
@@ -227,7 +277,25 @@ impl Keymap {
                 self.pending_operator = Some(PendingOperator::Delete);
                 None
             }
-            KeyCode::Char('D') => Some(Action::ClearMotion(Motion::LineEnd)),
+            KeyCode::Char('D') => Some(Action::CutMotion(Motion::LineEnd)),
+            KeyCode::Char('p') => Some(Action::Paste {
+                before: false,
+                source: self.next_register.take().unwrap_or(PasteSource::Unnamed),
+            }),
+            KeyCode::Char('P') => Some(Action::Paste {
+                before: true,
+                source: self.next_register.take().unwrap_or(PasteSource::Unnamed),
+            }),
+            KeyCode::Char('o') => Some(Action::InsertRows {
+                before: false,
+                enter_insert: true,
+                count: 1,
+            }),
+            KeyCode::Char('O') => Some(Action::InsertRows {
+                before: true,
+                enter_insert: true,
+                count: 1,
+            }),
             KeyCode::Char('u') => Some(Action::Undo),
             KeyCode::Char('Z') => {
                 self.pending_z = true;
@@ -283,6 +351,8 @@ impl Keymap {
         self.pending_operator = None;
         self.pending_replace = false;
         self.pending_z = false;
+        self.awaiting_register = false;
+        self.next_register = None;
     }
 }
 

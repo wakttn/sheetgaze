@@ -7,6 +7,7 @@ use crate::domain::error::ClipboardError;
 
 pub trait ClipboardSink: Send {
     fn write(&mut self, text: &str) -> Result<(), ClipboardError>;
+    fn read(&mut self) -> Result<String, ClipboardError>;
     fn name(&self) -> &'static str;
 }
 
@@ -49,6 +50,10 @@ impl ClipboardSink for Osc52Sink {
             .map_err(|error| ClipboardError::Write(error.to_string()))
     }
 
+    fn read(&mut self) -> Result<String, ClipboardError> {
+        Err(ClipboardError::ReadUnavailable)
+    }
+
     fn name(&self) -> &'static str {
         "osc52"
     }
@@ -76,6 +81,12 @@ impl ClipboardSink for SystemClipboardSink {
             .map_err(|error| ClipboardError::Write(error.to_string()))
     }
 
+    fn read(&mut self) -> Result<String, ClipboardError> {
+        self.clipboard
+            .get_text()
+            .map_err(|error| ClipboardError::Write(error.to_string()))
+    }
+
     fn name(&self) -> &'static str {
         "system"
     }
@@ -97,6 +108,10 @@ impl ClipboardSink for SystemClipboardSink {
         Err(ClipboardError::Unavailable)
     }
 
+    fn read(&mut self) -> Result<String, ClipboardError> {
+        Err(ClipboardError::ReadUnavailable)
+    }
+
     fn name(&self) -> &'static str {
         "system"
     }
@@ -110,6 +125,12 @@ pub struct ClipboardService {
 pub struct CopyResult {
     pub sink: &'static str,
     pub bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClipboardRead {
+    pub text: String,
+    pub sink: &'static str,
 }
 
 impl ClipboardService {
@@ -152,5 +173,24 @@ impl ClipboardService {
             }
         }
         Err(last_error.unwrap_or(ClipboardError::Unavailable))
+    }
+
+    pub fn read(&mut self) -> Result<ClipboardRead, ClipboardError> {
+        if self.sinks.is_empty() {
+            return Err(ClipboardError::ReadUnavailable);
+        }
+        let mut last_error = None;
+        for sink in &mut self.sinks {
+            match sink.read() {
+                Ok(text) => {
+                    return Ok(ClipboardRead {
+                        text,
+                        sink: sink.name(),
+                    });
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or(ClipboardError::ReadUnavailable))
     }
 }

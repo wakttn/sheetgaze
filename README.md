@@ -67,8 +67,15 @@ Useful options:
 --watch poll|native|auto|off
 --watch-interval-ms 1000
 --max-copy-cells 200000
+--clipboard-register unnamedplus|internal
+--structural-max-cells 500000
 --osc52-max-bytes 262144
 ```
+
+`--clipboard-register unnamedplus` is the default and follows Vim's
+`clipboard=unnamedplus`: `p` reads the system clipboard and falls back to the
+in-app register when reading is unavailable. The optional `system-clipboard`
+feature is required to read the native OS clipboard; OSC 52 remains write-only.
 
 `--layout excel` (the default) uses explicit Excel column widths (`customWidth`) and row heights (`customHeight`) when present, and auto-fits only the unspecified columns and rows. `--layout content` ignores Excel sizes and auto-fits everything from cell content. csv files always use content-based layout. Column widths are converted from Excel character units by truncating the fraction, and row heights are converted from points by dividing by 15pt and rounding to terminal lines.
 
@@ -85,23 +92,26 @@ cargo run --release --features system-clipboard -- path/to/book.xlsx
 - `{` / `}`: first / last row of the used range
 - `0` / `^` / `$`: line start / first non-blank / line end
 - `Ctrl-d` / `Ctrl-u`, `PageUp` / `PageDown`: page movement
-- `v` / `V`: range / row selection
+- `v` / `V` / `C` / `Ctrl-V`: cell / row / column / rectangular block selection
 - `w`: toggle fit-to-width mode
-- `y`: copy (exits visual mode)
+- `y` / `yy` / `Y`: yank selection / current row
+- `p` / `P`: paste after / before; `"+p` reads the system clipboard, `"0p` reads the yank register
+- `x` / `d{motion}`: cut cell or range contents; `dd` cuts the current row and shifts rows up
+- `o` / `O`: insert a row below / above and start editing
+- `gI` / `gA`: insert a column left / right and start editing
 - `i` / `a` / `I` / `A` / `F2`: edit cell (start / end cursor)
 - `s`: clear the cell and start editing
 - `=`: start editing a formula
 - `Enter` / `Tab` / `Shift-Tab`: commit and move down / right / left
 - `Esc`: commit edit; `Ctrl-c`: cancel edit
-- `x`: clear cell or selection
 - `r{char}`: replace cell or selection contents
-- `d` + motion / `dd` / `D`: clear contents (row structure is kept)
+- `d$` / `V` + `Delete`: clear contents without changing row structure
 - `u` / `Ctrl-r`: undo / redo
 - `K` or `Enter`: cell detail
 - `/`, `n`, `N`: workbook search / next / previous
 - `*` / `#`: search the current cell value
 - `Ctrl-o` / `Ctrl-i`: jump back / forward
-- `:`: command line (`:w`, `:w!`, `:q`, `:q!`, `:wq`, `:x`, `:e`, `:e!`, `:s`, `:%s`, `:gs`, `:goto Sheet!A1`)
+- `:`: command line (`:w`, `:w!`, `:q`, `:q!`, `:wq`, `:x`, `:e`, `:e!`, `:s`, `:%s`, `:gs`, `:goto Sheet!A1`, `:irow`, `:icol`, `:drow`, `:dcol`, `:put`)
 - `ZZ` / `ZQ`: save and quit / discard and quit
 - `f`: filter panel
 - `Tab` / `Shift-Tab`: switch sheet
@@ -144,12 +154,12 @@ package version in `Cargo.toml`:
 # 1. Bump `version` in Cargo.toml and refresh Cargo.lock.
 cargo check
 git add Cargo.toml Cargo.lock
-git commit -m "Release v0.2.0"
+git commit -m "Release v0.2.1"
 git push origin main
 
 # 2. Push the matching tag.
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 The workflow runs `cargo fmt --check`, Clippy, and the test suite before
@@ -175,7 +185,10 @@ produce a half-populated public release.
 - Color/icon/dynamic filters are reported as unsupported; value-list, custom, and Top10 filters are evaluated.
 - Conditional formatting supports numeric `cellIs` rules (equal, comparison, between, and not-between); color scales, data bars, icon sets, and formula rules are not evaluated.
 - In `--fill-mode border`, fills are drawn as thin outlines using the fill color. Explicit Excel borders are recolored to the fill color, and text on filled cells uses the terminal foreground for readability.
-- The optional `system-clipboard` feature is needed for native OS clipboard use; the default uses OSC 52.
+- The optional `system-clipboard` feature is needed for native OS clipboard use; the default uses OSC 52. OSC 52 is write-only, so `p` falls back to the in-app register over SSH unless the OS clipboard is readable.
+- Structural editing materializes the active sheet in memory. `--structural-max-cells` limits this; larger sheets require `--lazy never`-friendly sizes or a smaller sheet.
+- Structural save rejects shared formulas, array formulas, table parts, and structured references rather than risking workbook corruption.
+- `dd` now cuts the whole row and shifts rows up; use `d$` or `V` then `Delete` to clear contents without changing row structure.
 
 ## License
 

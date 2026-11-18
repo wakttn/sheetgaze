@@ -93,7 +93,7 @@ fn search_moves_between_matches_and_copies() {
     state.apply(Action::SearchNext);
     assert_eq!(state.focus.a1(), "A4");
     let effects = state.apply(Action::Copy);
-    let Effect::WriteClipboard(text) = effects.into_iter().next().unwrap() else {
+    let Effect::WriteClipboard { text, .. } = effects.into_iter().next().unwrap() else {
         panic!("expected clipboard effect");
     };
     assert_eq!(text, "East");
@@ -106,7 +106,7 @@ fn visual_selection_copies_tsv() {
     state.apply(Action::Extend(Motion::Down));
     state.apply(Action::Extend(Motion::Right));
     let effects = state.apply(Action::Copy);
-    let Effect::WriteClipboard(text) = effects.into_iter().next().unwrap() else {
+    let Effect::WriteClipboard { text, .. } = effects.into_iter().next().unwrap() else {
         panic!("expected clipboard effect");
     };
     assert!(text.contains('\t'));
@@ -336,12 +336,39 @@ fn keymap_binds_vim_editing_keys() {
     assert_eq!(keymap.translate(key('d'), Mode::Normal), None);
     assert_eq!(
         keymap.translate(key('d'), Mode::Normal),
-        Some(Action::ClearRow)
+        Some(Action::CutRow)
     );
     assert_eq!(keymap.translate(key('r'), Mode::Normal), None);
     assert_eq!(
         keymap.translate(key('x'), Mode::Normal),
         Some(Action::ReplaceChar('x'))
+    );
+    assert_eq!(
+        keymap.translate(key('C'), Mode::Normal),
+        Some(Action::ToggleColumnVisual)
+    );
+    assert_eq!(
+        keymap.translate(ctrl('v'), Mode::Normal),
+        Some(Action::ToggleBlockVisual)
+    );
+    assert_eq!(
+        keymap.translate(key('o'), Mode::Normal),
+        Some(Action::InsertRows {
+            before: false,
+            enter_insert: true,
+            count: 1
+        })
+    );
+    assert_eq!(
+        keymap.translate(key('p'), Mode::Normal),
+        Some(Action::Paste {
+            before: false,
+            source: sheetgaze::domain::register::PasteSource::Unnamed
+        })
+    );
+    assert_eq!(
+        keymap.translate(key('Y'), Mode::Normal),
+        Some(Action::YankRow)
     );
     assert_eq!(
         keymap.translate(ctrl('r'), Mode::Normal),

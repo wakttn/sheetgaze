@@ -12,12 +12,20 @@ pub fn render(frame: &mut ratatui::Frame, help: &HelpView, area: Rect) {
     frame.render_widget(block, popup);
     let mut lines = vec!["Navigation  h j k l / arrows, gg G { } 0 ^ $ Ctrl-d Ctrl-u".to_string()];
     lines.push("Search      / then Enter, n / N (works across sheets), * / #".to_string());
+    lines.push("Select      v cell, V row, C column, Ctrl-V block, Esc clear".to_string());
     lines.push(
         "Edit        i a I A, s clear+edit, = formula, Enter/Tab commit, Esc commit".to_string(),
     );
     lines.push(
-        "Edit ops    x clear, r{char} replace, dd clear row, d{motion} clear range".to_string(),
+        "Edit ops    r{char} replace, d{motion} clear range, d$ / V+Delete clear row".to_string(),
     );
+    lines.push(
+        "Clipboard   y yank, yy/Y yank row, x/dd cut, p/P paste, \"0 / \"+ registers".to_string(),
+    );
+    lines.push(
+        "Structure   o/O insert row, gI/gA insert column, :irow :icol :drow :dcol :put".to_string(),
+    );
+    lines.push("Note        dd cuts the row (structure changes); undo with u".to_string());
     lines.push("History     u undo, Ctrl-r redo, Ctrl-o / Ctrl-i jump back / forward".to_string());
     lines.push("Command     :w :w! :q :q! :wq :x :e :e! :s :%s :gs :goto".to_string());
     lines.push("Filter      f, Space toggle, a all, c clear, Esc close".to_string());

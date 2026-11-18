@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use crate::config::LazyMode;
@@ -87,6 +87,7 @@ pub fn load_csv(
     } else {
         SheetData::Eager(eager)
     };
+    let (origin_rows, origin_cols) = Sheet::identity_origins(row_count, column_count);
     let sheet = Sheet {
         name: path
             .file_stem()
@@ -101,6 +102,10 @@ pub fn load_csv(
         data_rows: data_rows.finish(),
         data,
         edits: HashMap::new(),
+        origin_rows,
+        origin_cols,
+        structural_dirty: false,
+        formula_rewrites: BTreeMap::new(),
         merges: MergeIndex::empty(),
         merge_borders: HashMap::new(),
         layout,

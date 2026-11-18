@@ -60,6 +60,8 @@ pub enum ClipboardError {
     Unavailable,
     #[error("clipboard write failed: {0}")]
     Write(String),
+    #[error("clipboard read is not available in this environment")]
+    ReadUnavailable,
     #[error("OSC 52 payload is too large: {bytes} bytes (limit {limit})")]
     Osc52PayloadTooLarge { bytes: usize, limit: usize },
 }
@@ -112,6 +114,8 @@ pub enum SaveError {
         addr: String,
         message: String,
     },
+    #[error("unsupported structure in {sheet}: {message}")]
+    UnsupportedStructure { sheet: String, message: String },
     #[error("file changed on disk; use :w! to overwrite")]
     Stale,
 }

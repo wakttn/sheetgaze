@@ -4,7 +4,7 @@ use crate::domain::filter::{FilterState, VisibilityMap};
 use crate::domain::layout::{RenderPlan, Viewport};
 use crate::domain::mode::Mode;
 use crate::domain::search::SearchIndex;
-use crate::domain::selection::Selection;
+use crate::domain::selection::{Selection, SelectionMode};
 
 #[derive(Clone, Debug)]
 pub struct ScreenView {
@@ -47,6 +47,7 @@ pub struct StatusView {
     pub dirty: bool,
     pub fit_label: String,
     pub selection_count: usize,
+    pub selection_kind: Option<SelectionMode>,
     pub formula_label: String,
     pub search_label: String,
     pub filter_label: String,

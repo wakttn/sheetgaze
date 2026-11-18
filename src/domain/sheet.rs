@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::domain::addr::{CellAddr, CellRange};
 use crate::domain::cell::{Cell, CellRead, EffectiveCell};
@@ -56,6 +56,14 @@ pub struct Sheet {
     pub data: SheetData,
     /// Unsaved edits layered over `data`. The base workbook is never mutated.
     pub edits: HashMap<CellAddr, Cell>,
+    /// Current row/column index to the original xlsx index. Inserted rows and
+    /// columns have `None`.
+    pub origin_rows: Vec<Option<u32>>,
+    pub origin_cols: Vec<Option<u32>>,
+    pub structural_dirty: bool,
+    /// Formula expressions rewritten after structural edits, keyed by the
+    /// current cell address.
+    pub formula_rewrites: BTreeMap<CellAddr, String>,
     pub merges: MergeIndex,
     pub merge_borders: HashMap<CellAddr, CellBorders>,
     pub layout: LayoutSnapshot,
@@ -73,6 +81,10 @@ pub struct Sheet {
 }
 
 impl Sheet {
+    pub fn identity_origins(rows: u32, cols: u32) -> (Vec<Option<u32>>, Vec<Option<u32>>) {
+        ((0..rows).map(Some).collect(), (0..cols).map(Some).collect())
+    }
+
     pub fn data_start_row(&self) -> u32 {
         self.data_rows.map(|(first, _)| first).unwrap_or(0)
     }
@@ -239,6 +251,31 @@ impl Sheet {
         self.used_range.end.col = self.used_range.end.col.max(addr.col);
         self.meta.row_count = self.meta.row_count.max(addr.row + 1);
         self.meta.column_count = self.meta.column_count.max(addr.col + 1);
+        while self.origin_rows.len() < self.meta.row_count as usize {
+            self.origin_rows.push(None);
+        }
+        while self.origin_cols.len() < self.meta.column_count as usize {
+            self.origin_cols.push(None);
+        }
+    }
+
+    /// Called after a successful structural save. The saved file now uses the
+    /// current coordinates, so the origin map becomes identity and the edit
+    /// overlay is folded into the base cells.
+    pub fn normalize_after_structural_save(&mut self) {
+        if !self.structural_dirty {
+            return;
+        }
+        if let SheetData::Eager(cells) = &mut self.data {
+            for (addr, cell) in self.edits.drain() {
+                cells.insert(addr, cell);
+            }
+        }
+        self.origin_rows = (0..self.meta.row_count).map(Some).collect();
+        self.origin_cols = (0..self.meta.column_count).map(Some).collect();
+        self.formula_rewrites.clear();
+        self.structural_dirty = false;
+        let _ = self.rebuild_visibility();
     }
 
     pub fn invalidate_filter_masks(&mut self) {

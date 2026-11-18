@@ -1,4 +1,5 @@
 use crate::domain::edit::{EditCommit, EditCursor};
+use crate::domain::register::{PasteSource, RegisterKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Motion {
@@ -19,14 +20,23 @@ pub enum Motion {
     FirstNonBlank,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardWriteOrigin {
+    Register { kind: RegisterKind },
+    PlainCopy,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     Move(Motion),
     Extend(Motion),
     ToggleVisual,
     ToggleLineVisual,
+    ToggleColumnVisual,
+    ToggleBlockVisual,
     ToggleFitWidth,
     Copy,
+    YankRow,
     OpenDetail,
     CloseDetail,
     ScrollDetail(i32),
@@ -46,7 +56,10 @@ pub enum Action {
     FilterClose,
     Reload,
     ReloadForce,
-    Save { force: bool, quit_after: bool },
+    Save {
+        force: bool,
+        quit_after: bool,
+    },
     EditStart(EditCursor),
     EditClear,
     EditFormula,
@@ -72,6 +85,32 @@ pub enum Action {
     ClearCell,
     ClearRow,
     ClearMotion(Motion),
+    Cut,
+    CutRow,
+    CutSelection,
+    CutMotion(Motion),
+    Paste {
+        before: bool,
+        source: PasteSource,
+    },
+    InsertRows {
+        before: bool,
+        enter_insert: bool,
+        count: u32,
+    },
+    InsertColumns {
+        before: bool,
+        enter_insert: bool,
+        count: u32,
+    },
+    DeleteRows {
+        before: bool,
+        count: u32,
+    },
+    DeleteColumns {
+        before: bool,
+        count: u32,
+    },
     ReplaceChar(char),
     SearchWord(bool),
     JumpBack,
@@ -85,9 +124,19 @@ pub enum Action {
 
 #[derive(Clone, Debug)]
 pub enum Effect {
-    WriteClipboard(String),
+    WriteClipboard {
+        text: String,
+        origin: ClipboardWriteOrigin,
+    },
+    ReadClipboard {
+        before: bool,
+        fallback: Option<PasteSource>,
+    },
     SetStatus(String),
     Reload,
-    Save { force: bool, quit_after: bool },
+    Save {
+        force: bool,
+        quit_after: bool,
+    },
     Quit,
 }

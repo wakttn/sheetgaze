@@ -1,26 +1,33 @@
-use crate::app::action::{Action, Effect, Motion};
+use crate::app::action::{Action, ClipboardWriteOrigin, Effect, Motion};
+use crate::app::paste::PastePlanner;
 use crate::app::reload::{ReloadSummary, ReloadTrigger};
+use crate::app::structure_flow::{StructureFlow, WorkbookStructureOutcome};
 use crate::config::Config;
 use crate::domain::addr::{CellAddr, CellRange};
 use crate::domain::cell::{Cell, CellRead, CellValue};
 use crate::domain::command::{self, ExCommand, SubstituteCommand, SubstituteScope};
-use crate::domain::copy::{CopyEncoder, CopyLimits};
 use crate::domain::edit::{
-    self, EditChange, EditCursor, EditLog, EditTransaction, InputKind, InputState,
+    self, EditChange, EditCursor, EditLog, EditOp, EditTransaction, InputKind, InputState,
+    StructureEdit,
 };
 use crate::domain::filter::{FilterSource, FilterState};
 use crate::domain::formula::FormulaResults;
 use crate::domain::jump::{JumpEntry, JumpList};
 use crate::domain::layout::{ColumnWidths, LayoutEngine, RenderPlan, Viewport};
 use crate::domain::mode::Mode;
+use crate::domain::register::{
+    ClipboardBlock, PasteSource, RegisterKind, RegisterLimits, RegisterStore,
+};
 use crate::domain::reload::WatchMode;
 use crate::domain::row_store::RowRange;
 use crate::domain::search::{MatchSource, SearchIndex, SearchMatch, SearchQuery};
-use crate::domain::selection::Selection;
+use crate::domain::selection::{Selection, SelectionMode};
 use crate::domain::sheet::Sheet;
+use crate::domain::structure::{Axis, StructureOp, StructureWarning};
 use crate::domain::task::Generation;
 use crate::domain::viewport::ViewportPlanner;
 use crate::domain::workbook::{SourceFormat, WorkbookModel};
+use crate::io::tsv::TsvCodec;
 use crate::ui::view::{
     DetailView, FilterPanelView, HelpView, InputLineView, ScreenView, SearchHighlight,
     SearchPromptView, StatusView,
@@ -49,6 +56,7 @@ pub struct AppState {
     pub command_history: Vec<String>,
     pub command_history_index: Option<usize>,
     pub jump_list: JumpList,
+    pub registers: RegisterStore,
     pub pending_recalc: bool,
     pub read_only: bool,
 }
@@ -91,6 +99,7 @@ impl AppState {
             command_history: Vec::new(),
             command_history_index: None,
             jump_list: JumpList::new(),
+            registers: RegisterStore::default(),
             pending_recalc: false,
             read_only,
         }
@@ -464,6 +473,16 @@ impl AppState {
                 self.mode = Mode::Visual;
                 Vec::new()
             }
+            Action::ToggleColumnVisual => {
+                self.selection = Some(Selection::column(self.focus));
+                self.mode = Mode::Visual;
+                Vec::new()
+            }
+            Action::ToggleBlockVisual => {
+                self.selection = Some(Selection::block(self.focus));
+                self.mode = Mode::Visual;
+                Vec::new()
+            }
             Action::ToggleFitWidth => {
                 self.fit_width = !self.fit_width;
                 if self.fit_width {
@@ -472,19 +491,25 @@ impl AppState {
                 self.ensure_focus_visible();
                 Vec::new()
             }
-            Action::Copy => match self.copy_payload() {
-                Ok(payload) => {
-                    if self.mode == Mode::Visual {
-                        self.selection = None;
-                        self.mode = Mode::Normal;
-                    }
-                    vec![Effect::WriteClipboard(payload.text)]
-                }
-                Err(message) => {
-                    self.status_message = Some(message);
-                    Vec::new()
-                }
-            },
+            Action::Copy => self.yank_selection(),
+            Action::YankRow => self.yank_row(),
+            Action::Cut => self.cut_current(),
+            Action::CutRow => self.cut_rows(1),
+            Action::CutSelection => self.cut_selection(),
+            Action::CutMotion(motion) => self.cut_motion(motion),
+            Action::Paste { before, source } => self.paste(before, source),
+            Action::InsertRows {
+                before,
+                enter_insert,
+                count,
+            } => self.insert_rows(before, enter_insert, count),
+            Action::InsertColumns {
+                before,
+                enter_insert,
+                count,
+            } => self.insert_columns(before, enter_insert, count),
+            Action::DeleteRows { before, count } => self.delete_rows(before, count),
+            Action::DeleteColumns { before, count } => self.delete_columns(before, count),
             Action::OpenDetail => {
                 self.ensure_focus_loaded();
                 if self.detail_view().is_some() {
@@ -623,6 +648,22 @@ impl AppState {
         self.edit_log.is_dirty()
     }
 
+    pub fn has_structural_changes(&self) -> bool {
+        self.workbook
+            .as_ref()
+            .is_some_and(|workbook| workbook.sheets.iter().any(|sheet| sheet.structural_dirty))
+    }
+
+    pub fn normalize_after_save(&mut self) {
+        if let Some(workbook) = &mut self.workbook {
+            for sheet in &mut workbook.sheets {
+                sheet.normalize_after_structural_save();
+            }
+        }
+        self.edit_log.reset_after_save();
+        self.pending_recalc = false;
+    }
+
     pub fn editing_enabled(&self) -> bool {
         !self.read_only
     }
@@ -756,11 +797,7 @@ impl AppState {
             self.status_message = Some("already at the oldest change".to_string());
             return;
         };
-        let sheets: Vec<usize> = transaction
-            .changes
-            .iter()
-            .map(|change| change.sheet)
-            .collect();
+        let sheets = transaction_sheets(&transaction);
         for &index in &sheets {
             if let Some(sheet) = workbook.sheets.get_mut(index) {
                 let _ = sheet.rebuild_visibility();
@@ -771,7 +808,7 @@ impl AppState {
         self.pending_recalc = self.has_formulas();
         self.ensure_focus_loaded();
         self.ensure_focus_visible();
-        self.status_message = Some(format!("undo: {} cells", transaction.cell_count()));
+        self.status_message = Some(format!("undo: {}", transaction.summary()));
     }
 
     fn redo(&mut self) {
@@ -782,11 +819,7 @@ impl AppState {
             self.status_message = Some("already at the newest change".to_string());
             return;
         };
-        let sheets: Vec<usize> = transaction
-            .changes
-            .iter()
-            .map(|change| change.sheet)
-            .collect();
+        let sheets = transaction_sheets(&transaction);
         for &index in &sheets {
             if let Some(sheet) = workbook.sheets.get_mut(index) {
                 let _ = sheet.rebuild_visibility();
@@ -797,7 +830,7 @@ impl AppState {
         self.pending_recalc = self.has_formulas();
         self.ensure_focus_loaded();
         self.ensure_focus_visible();
-        self.status_message = Some(format!("redo: {} cells", transaction.cell_count()));
+        self.status_message = Some(format!("redo: {}", transaction.summary()));
     }
 
     fn open_command(&mut self) {
@@ -914,6 +947,13 @@ impl AppState {
                 self.status_message = Some(format!("sheet: {name}"));
                 Ok(Vec::new())
             }
+            ExCommand::InsertRows { before, count } => Ok(self.insert_rows(before, false, count)),
+            ExCommand::InsertColumns { before, count } => {
+                Ok(self.insert_columns(before, false, count))
+            }
+            ExCommand::DeleteRows { before, count } => Ok(self.delete_rows(before, count)),
+            ExCommand::DeleteColumns { before, count } => Ok(self.delete_columns(before, count)),
+            ExCommand::Put { before, source } => Ok(self.paste(before, source)),
             ExCommand::Help => {
                 self.mode = Mode::Help;
                 Ok(Vec::new())
@@ -932,7 +972,12 @@ impl AppState {
         };
         let range = self.selection.map_or_else(
             || CellRange::single(self.focus),
-            |selection| selection.range(sheet.used_range.end.col + 1),
+            |selection| {
+                selection.range(
+                    sheet.used_range.end.row.saturating_add(1),
+                    sheet.used_range.end.col.saturating_add(1),
+                )
+            },
         );
         let sheet_index = self.active_sheet_index();
         if self.selection.is_some() {
@@ -1015,7 +1060,12 @@ impl AppState {
             return Ok(0);
         }
         let count = changes.len();
-        self.edit_log.record(EditTransaction { changes });
+        self.edit_log.record(EditTransaction::from_ops(
+            changes
+                .into_iter()
+                .map(|change| EditOp::Cell(Box::new(change)))
+                .collect(),
+        ));
         self.after_edit(&[sheet_index]);
         Ok(count)
     }
@@ -1030,7 +1080,12 @@ impl AppState {
         };
         let range = self.selection.map_or_else(
             || CellRange::single(self.focus),
-            |selection| selection.range(sheet.used_range.end.col + 1),
+            |selection| {
+                selection.range(
+                    sheet.used_range.end.row.saturating_add(1),
+                    sheet.used_range.end.col.saturating_add(1),
+                )
+            },
         );
         let sheet_index = self.active_sheet_index();
         let Some(workbook) = &mut self.workbook else {
@@ -1059,7 +1114,12 @@ impl AppState {
             return;
         }
         let count = changes.len();
-        self.edit_log.record(EditTransaction { changes });
+        self.edit_log.record(EditTransaction::from_ops(
+            changes
+                .into_iter()
+                .map(|change| EditOp::Cell(Box::new(change)))
+                .collect(),
+        ));
         self.selection = None;
         self.mode = Mode::Normal;
         self.after_edit(&[sheet_index]);
@@ -1211,7 +1271,13 @@ impl AppState {
                     .sheets
                     .get(active_sheet)
                     .ok_or_else(|| "no sheet".to_string())?;
-                targets.push((active_sheet, selection.range(sheet.used_range.end.col + 1)));
+                targets.push((
+                    active_sheet,
+                    selection.range(
+                        sheet.used_range.end.row.saturating_add(1),
+                        sheet.used_range.end.col.saturating_add(1),
+                    ),
+                ));
             }
             SubstituteScope::Range(range) => {
                 targets.push((active_sheet, *range));
@@ -1303,7 +1369,12 @@ impl AppState {
             sheets.dedup();
             sheets
         };
-        self.edit_log.record(EditTransaction { changes });
+        self.edit_log.record(EditTransaction::from_ops(
+            changes
+                .into_iter()
+                .map(|change| EditOp::Cell(Box::new(change)))
+                .collect(),
+        ));
         self.selection = None;
         self.mode = Mode::Normal;
         self.after_edit(&sheets);
@@ -1488,29 +1559,615 @@ impl AppState {
         }
     }
 
-    fn copy_payload(&mut self) -> Result<crate::domain::copy::CopyPayload, String> {
-        let Some(selection) = self.selection else {
-            self.ensure_focus_loaded();
-            let Some(sheet) = self.active_sheet() else {
-                return Err("no sheet".to_string());
-            };
-            let cell = sheet.read_cell(self.focus);
-            return match cell {
-                CellRead::Loaded(cell) => Ok(CopyEncoder::single(&cell)),
-                CellRead::Pending => Err("row is still loading".to_string()),
-                CellRead::Missing => Err("cell is outside the sheet".to_string()),
-            };
-        };
-        let limits = CopyLimits {
-            max_cells: self.config.cli.max_copy_cells,
-        };
+    fn selection_range(&self) -> Option<CellRange> {
+        let sheet = self.active_sheet()?;
+        let rows = sheet
+            .meta
+            .row_count
+            .max(sheet.used_range.end.row.saturating_add(1));
+        let cols = sheet.used_range.end.col.saturating_add(1);
+        self.selection.map(|selection| selection.range(rows, cols))
+    }
+
+    fn build_clipboard_block(
+        &mut self,
+        range: CellRange,
+        kind: RegisterKind,
+    ) -> Result<ClipboardBlock, String> {
         let index = self.active_sheet_index();
-        let Some(workbook) = &mut self.workbook else {
+        if let Some(workbook) = &mut self.workbook {
+            let _ = workbook.ensure_rows(
+                index,
+                RowRange::new(range.start.row, range.end.row.saturating_add(1)),
+            );
+        }
+        let limit = self.config.cli.max_copy_cells;
+        let cells = (range.row_count() as usize).saturating_mul(range.col_count() as usize);
+        if cells > limit {
+            return Err(format!(
+                "selection is too large: {cells} cells (limit {limit})"
+            ));
+        }
+        let Some(sheet) = self.active_sheet() else {
             return Err("no sheet".to_string());
         };
-        workbook
-            .copy_selection(index, &selection, &limits)
-            .map_err(|error| error.to_string())
+        let complete = kind == RegisterKind::Cells;
+        let mut block = ClipboardBlock::new(kind, range.col_count(), range.row_count(), complete);
+        for row in range.rows() {
+            for col in range.cols() {
+                let addr = CellAddr::new(row, col);
+                let cell = if sheet.merges.is_covered(addr) {
+                    None
+                } else {
+                    sheet.cell(addr).cloned()
+                };
+                if complete {
+                    block.insert(
+                        row.saturating_sub(range.start.row),
+                        col.saturating_sub(range.start.col),
+                        cell.unwrap_or_else(empty_cell),
+                    );
+                } else if let Some(cell) = cell {
+                    block.insert(
+                        row.saturating_sub(range.start.row),
+                        col.saturating_sub(range.start.col),
+                        cell,
+                    );
+                }
+            }
+        }
+        Ok(block)
+    }
+
+    fn clipboard_effect(&self, block: ClipboardBlock) -> Vec<Effect> {
+        match TsvCodec::encode(&block) {
+            Ok(text) => vec![Effect::WriteClipboard {
+                text,
+                origin: ClipboardWriteOrigin::Register { kind: block.kind },
+            }],
+            Err(error) => vec![Effect::SetStatus(error.to_string())],
+        }
+    }
+
+    fn yank_selection(&mut self) -> Vec<Effect> {
+        let kind = match self.selection.map(|selection| selection.mode) {
+            Some(SelectionMode::Row) => RegisterKind::Rows,
+            Some(SelectionMode::Column) => RegisterKind::Columns,
+            _ => RegisterKind::Cells,
+        };
+        let range = self
+            .selection_range()
+            .unwrap_or_else(|| CellRange::single(self.focus));
+        match self.build_clipboard_block(range, kind) {
+            Ok(block) => {
+                self.registers.set_yank(block.clone());
+                self.selection = None;
+                self.mode = Mode::Normal;
+                self.clipboard_effect(block)
+            }
+            Err(message) => {
+                self.status_message = Some(message);
+                Vec::new()
+            }
+        }
+    }
+
+    fn yank_row(&mut self) -> Vec<Effect> {
+        let Some(sheet) = self.active_sheet() else {
+            return Vec::new();
+        };
+        let range = CellRange::new(
+            CellAddr::new(self.focus.row, 0),
+            CellAddr::new(self.focus.row, sheet.used_range.end.col),
+        );
+        match self.build_clipboard_block(range, RegisterKind::Rows) {
+            Ok(block) => {
+                self.registers.set_yank(block.clone());
+                self.clipboard_effect(block)
+            }
+            Err(message) => {
+                self.status_message = Some(message);
+                Vec::new()
+            }
+        }
+    }
+
+    fn cut_current(&mut self) -> Vec<Effect> {
+        if self.selection.is_some() {
+            return self.cut_selection();
+        }
+        let range = CellRange::single(self.focus);
+        self.cut_range(range, RegisterKind::Cells, None)
+    }
+
+    fn cut_selection(&mut self) -> Vec<Effect> {
+        let Some(selection) = self.selection else {
+            return self.cut_current();
+        };
+        let kind = match selection.mode {
+            SelectionMode::Row => RegisterKind::Rows,
+            SelectionMode::Column => RegisterKind::Columns,
+            _ => RegisterKind::Cells,
+        };
+        let range = self
+            .selection_range()
+            .unwrap_or_else(|| CellRange::single(self.focus));
+        let structure = match selection.mode {
+            SelectionMode::Row => Some(StructureOp::delete(
+                Axis::Row,
+                range.start.row,
+                range.row_count(),
+            )),
+            SelectionMode::Column => Some(StructureOp::delete(
+                Axis::Column,
+                range.start.col,
+                range.col_count(),
+            )),
+            _ => None,
+        };
+        self.cut_range(range, kind, structure)
+    }
+
+    fn cut_motion(&mut self, motion: Motion) -> Vec<Effect> {
+        let Some(target) = self.motion_target(motion) else {
+            return Vec::new();
+        };
+        let range = CellRange::new(self.focus, target);
+        self.cut_range(range, RegisterKind::Cells, None)
+    }
+
+    fn cut_rows(&mut self, count: u32) -> Vec<Effect> {
+        self.cut_rows_at(self.focus.row, count)
+    }
+
+    fn cut_rows_at(&mut self, index: u32, count: u32) -> Vec<Effect> {
+        if !self.editing_allowed() {
+            self.status_message = Some("editing is not available".to_string());
+            return Vec::new();
+        }
+        if count == 0 || count > 1000 {
+            self.status_message = Some("count must be between 1 and 1000".to_string());
+            return Vec::new();
+        }
+        let Some(sheet) = self.active_sheet() else {
+            return Vec::new();
+        };
+        if index.saturating_add(count) > sheet.meta.row_count {
+            self.status_message = Some("row range is outside the sheet".to_string());
+            return Vec::new();
+        }
+        let last_col = sheet
+            .used_range
+            .end
+            .col
+            .min(sheet.meta.column_count.saturating_sub(1));
+        let range = CellRange::new(
+            CellAddr::new(index, 0),
+            CellAddr::new(index.saturating_add(count).saturating_sub(1), last_col),
+        );
+        self.cut_range(
+            range,
+            RegisterKind::Rows,
+            Some(StructureOp::delete(Axis::Row, index, count)),
+        )
+    }
+
+    fn cut_columns_at(&mut self, index: u32, count: u32) -> Vec<Effect> {
+        if !self.editing_allowed() {
+            self.status_message = Some("editing is not available".to_string());
+            return Vec::new();
+        }
+        if count == 0 || count > 1000 {
+            self.status_message = Some("count must be between 1 and 1000".to_string());
+            return Vec::new();
+        }
+        let Some(sheet) = self.active_sheet() else {
+            return Vec::new();
+        };
+        if index.saturating_add(count) > sheet.meta.column_count {
+            self.status_message = Some("column range is outside the sheet".to_string());
+            return Vec::new();
+        }
+        let last_row = sheet
+            .used_range
+            .end
+            .row
+            .min(sheet.meta.row_count.saturating_sub(1));
+        let range = CellRange::new(
+            CellAddr::new(0, index),
+            CellAddr::new(last_row, index.saturating_add(count).saturating_sub(1)),
+        );
+        self.cut_range(
+            range,
+            RegisterKind::Columns,
+            Some(StructureOp::delete(Axis::Column, index, count)),
+        )
+    }
+
+    fn cut_range(
+        &mut self,
+        range: CellRange,
+        kind: RegisterKind,
+        structure: Option<StructureOp>,
+    ) -> Vec<Effect> {
+        if !self.editing_allowed() {
+            self.status_message = Some("editing is not available".to_string());
+            return Vec::new();
+        }
+        let block = match self.build_clipboard_block(range, kind) {
+            Ok(block) => block,
+            Err(message) => {
+                self.status_message = Some(message);
+                return Vec::new();
+            }
+        };
+        self.registers.set_cut(block.clone());
+        let sheet_index = self.active_sheet_index();
+        let result = match structure {
+            Some(op) => self.apply_structure_op(op).map(|_| ()),
+            None => self.clear_range(sheet_index, range).map(|_| ()),
+        };
+        self.selection = None;
+        self.mode = Mode::Normal;
+        match result {
+            Ok(()) => self.clipboard_effect(block),
+            Err(message) => {
+                self.status_message = Some(message);
+                Vec::new()
+            }
+        }
+    }
+
+    fn insert_rows(&mut self, before: bool, enter_insert: bool, count: u32) -> Vec<Effect> {
+        if !self.editing_allowed() {
+            self.status_message = Some("editing is not available".to_string());
+            return Vec::new();
+        }
+        let index = if before {
+            self.focus.row
+        } else {
+            self.focus.row.saturating_add(1)
+        };
+        match self.apply_structure_op(StructureOp::insert(Axis::Row, index, count)) {
+            Ok(_) => {
+                self.focus.row = index.min(self.active_meta_rows().saturating_sub(1));
+                self.mode = Mode::Normal;
+                self.status_message = Some(format!("inserted {count} row(s)"));
+                if enter_insert {
+                    self.start_edit(EditCursor::Start, None);
+                }
+                Vec::new()
+            }
+            Err(message) => {
+                self.status_message = Some(message);
+                Vec::new()
+            }
+        }
+    }
+
+    fn insert_columns(&mut self, before: bool, enter_insert: bool, count: u32) -> Vec<Effect> {
+        if !self.editing_allowed() {
+            self.status_message = Some("editing is not available".to_string());
+            return Vec::new();
+        }
+        let index = if before {
+            self.focus.col
+        } else {
+            self.focus.col.saturating_add(1)
+        };
+        match self.apply_structure_op(StructureOp::insert(Axis::Column, index, count)) {
+            Ok(_) => {
+                self.focus.col = index.min(self.active_meta_cols().saturating_sub(1));
+                self.mode = Mode::Normal;
+                self.status_message = Some(format!("inserted {count} column(s)"));
+                if enter_insert {
+                    self.start_edit(EditCursor::Start, None);
+                }
+                Vec::new()
+            }
+            Err(message) => {
+                self.status_message = Some(message);
+                Vec::new()
+            }
+        }
+    }
+
+    fn delete_rows(&mut self, before: bool, count: u32) -> Vec<Effect> {
+        if before {
+            if self.focus.row < count {
+                self.status_message = Some("row range is outside the sheet".to_string());
+                return Vec::new();
+            }
+            self.cut_rows_at(self.focus.row - count, count)
+        } else {
+            self.cut_rows_at(self.focus.row, count)
+        }
+    }
+
+    fn delete_columns(&mut self, before: bool, count: u32) -> Vec<Effect> {
+        if before {
+            if self.focus.col < count {
+                self.status_message = Some("column range is outside the sheet".to_string());
+                return Vec::new();
+            }
+            self.cut_columns_at(self.focus.col - count, count)
+        } else {
+            self.cut_columns_at(self.focus.col, count)
+        }
+    }
+
+    fn apply_structure_op(&mut self, op: StructureOp) -> Result<WorkbookStructureOutcome, String> {
+        if !self.editing_allowed() {
+            return Err("editing is not available".to_string());
+        }
+        let sheet_index = self.active_sheet_index();
+        let max_cells = self.config.cli.structural_max_cells;
+        let outcome = {
+            let Some(workbook) = &mut self.workbook else {
+                return Err("no workbook".to_string());
+            };
+            StructureFlow::apply(workbook, sheet_index, op, max_cells)
+                .map_err(|error| error.to_string())?
+        };
+        let edit = StructureEdit {
+            sheet: sheet_index,
+            op,
+            removed: outcome.structure.removed.clone(),
+            before: outcome.structure.before.clone(),
+            after: outcome.structure.after.clone(),
+            formula_before: outcome.formula_before.clone(),
+            formula_after: outcome.formula_after.clone(),
+        };
+        self.edit_log
+            .record(EditTransaction::from_ops(vec![EditOp::Structure(
+                Box::new(edit),
+            )]));
+        self.after_structure_edit(&outcome);
+        Ok(outcome)
+    }
+
+    fn after_structure_edit(&mut self, outcome: &WorkbookStructureOutcome) {
+        self.after_structure_edit_parts(&outcome.affected_sheets, &outcome.warnings);
+    }
+
+    fn after_structure_edit_parts(
+        &mut self,
+        affected_sheets: &[usize],
+        warnings: &[StructureWarning],
+    ) {
+        if let Some(workbook) = &mut self.workbook {
+            workbook.generation = Generation(workbook.generation.0.saturating_add(1));
+        }
+        self.search_index = None;
+        self.jump_list.clear();
+        self.pending_recalc = self.has_formulas();
+        let rows = self.active_meta_rows();
+        let cols = self.active_meta_cols();
+        self.focus.row = self.focus.row.min(rows.saturating_sub(1));
+        self.focus.col = self.focus.col.min(cols.saturating_sub(1));
+        if let Some(selection) = &mut self.selection {
+            selection.anchor.row = selection.anchor.row.min(rows.saturating_sub(1));
+            selection.anchor.col = selection.anchor.col.min(cols.saturating_sub(1));
+            selection.cursor.row = selection.cursor.row.min(rows.saturating_sub(1));
+            selection.cursor.col = selection.cursor.col.min(cols.saturating_sub(1));
+        }
+        for &index in affected_sheets {
+            if let Some(sheet) = self
+                .workbook
+                .as_mut()
+                .and_then(|workbook| workbook.sheets.get_mut(index))
+            {
+                let _ = sheet.rebuild_visibility();
+            }
+        }
+        self.rebuild_visibility();
+        self.ensure_focus_loaded();
+        self.ensure_focus_visible();
+        if !warnings.is_empty() {
+            self.status_message = Some(format!(
+                "structure changed with {} warning(s)",
+                warnings.len()
+            ));
+        }
+    }
+
+    fn active_meta_rows(&self) -> u32 {
+        self.active_sheet()
+            .map(|sheet| sheet.meta.row_count.max(1))
+            .unwrap_or(1)
+    }
+
+    fn active_meta_cols(&self) -> u32 {
+        self.active_sheet()
+            .map(|sheet| sheet.meta.column_count.max(1))
+            .unwrap_or(1)
+    }
+
+    fn paste(&mut self, before: bool, source: PasteSource) -> Vec<Effect> {
+        match source {
+            PasteSource::System => vec![Effect::ReadClipboard {
+                before,
+                fallback: None,
+            }],
+            PasteSource::Yank => match self.registers.get(PasteSource::Yank).cloned() {
+                Some(block) => {
+                    self.paste_internal_block(block, before);
+                    Vec::new()
+                }
+                None => {
+                    self.status_message = Some("nothing to paste".to_string());
+                    Vec::new()
+                }
+            },
+            PasteSource::Unnamed => {
+                if matches!(
+                    self.config.cli.clipboard_register,
+                    crate::config::ClipboardRegisterMode::UnnamedPlus
+                ) {
+                    vec![Effect::ReadClipboard {
+                        before,
+                        fallback: Some(PasteSource::Unnamed),
+                    }]
+                } else {
+                    match self.registers.get(PasteSource::Unnamed).cloned() {
+                        Some(block) => {
+                            self.paste_internal_block(block, before);
+                            Vec::new()
+                        }
+                        None => {
+                            self.status_message = Some("nothing to paste".to_string());
+                            Vec::new()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn paste_clipboard_text(&mut self, text: &str, before: bool) {
+        if self.registers.last_text_matches(text)
+            && let Some(block) = self.registers.get(PasteSource::Unnamed).cloned()
+        {
+            self.paste_internal_block(block, before);
+            return;
+        }
+        let limits = RegisterLimits {
+            max_cells: self.config.cli.max_copy_cells,
+        };
+        match TsvCodec::decode(text, &limits) {
+            Ok(block) => self.paste_internal_block(block, before),
+            Err(error) => self.status_message = Some(format!("paste failed: {error}")),
+        }
+    }
+
+    pub fn paste_internal_block(&mut self, block: ClipboardBlock, before: bool) {
+        if block.is_empty() {
+            self.status_message = Some("nothing to paste".to_string());
+            return;
+        }
+        let cell_count = block.cell_count();
+        if cell_count > self.config.cli.max_copy_cells {
+            self.status_message = Some(format!(
+                "selection is too large: {cell_count} cells (limit {})",
+                self.config.cli.max_copy_cells
+            ));
+            return;
+        }
+        let sheet_index = self.active_sheet_index();
+        let plan = {
+            let Some(sheet) = self.active_sheet() else {
+                return;
+            };
+            match PastePlanner::plan(sheet, sheet_index, self.focus, before, &block) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    self.status_message = Some(error.to_string());
+                    return;
+                }
+            }
+        };
+        let mut edits = Vec::new();
+        let mut affected = vec![sheet_index];
+        let mut warnings = plan.warnings.clone();
+        for op in &plan.inserts {
+            let outcome = {
+                let Some(workbook) = &mut self.workbook else {
+                    return;
+                };
+                match StructureFlow::apply(
+                    workbook,
+                    sheet_index,
+                    *op,
+                    self.config.cli.structural_max_cells,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        self.status_message = Some(error.to_string());
+                        return;
+                    }
+                }
+            };
+            edits.push(EditOp::Structure(Box::new(StructureEdit {
+                sheet: sheet_index,
+                op: *op,
+                removed: outcome.structure.removed.clone(),
+                before: outcome.structure.before.clone(),
+                after: outcome.structure.after.clone(),
+                formula_before: outcome.formula_before.clone(),
+                formula_after: outcome.formula_after.clone(),
+            })));
+            for index in outcome.affected_sheets {
+                if !affected.contains(&index) {
+                    affected.push(index);
+                }
+            }
+            warnings.extend(outcome.warnings.iter().cloned());
+        }
+        let mut cell_changes = Vec::new();
+        if let Some(sheet) = self
+            .workbook
+            .as_mut()
+            .and_then(|workbook| workbook.sheets.get_mut(sheet_index))
+        {
+            for write in plan.writes {
+                if sheet.merges.is_covered(write.addr) {
+                    warnings.push(StructureWarning::SkippedCoveredCell { addr: write.addr });
+                    continue;
+                }
+                if write.addr.row >= crate::domain::structure::EXCEL_MAX_ROWS
+                    || write.addr.col >= crate::domain::structure::EXCEL_MAX_COLS
+                {
+                    continue;
+                }
+                let before_cell = sheet.raw_cell(write.addr).cloned();
+                let after = if write.cell.raw.is_empty() && write.cell.formula.is_none() {
+                    match &before_cell {
+                        Some(before) => {
+                            edit::parse_cell_input("", before.style, before.number_format.clone())
+                        }
+                        None => write.cell.clone(),
+                    }
+                } else {
+                    write.cell.clone()
+                };
+                sheet.set_edit_cell(write.addr, Some(after.clone()));
+                cell_changes.push(EditChange::new(
+                    sheet_index,
+                    write.addr,
+                    before_cell,
+                    Some(after),
+                ));
+            }
+        }
+        edits.extend(
+            cell_changes
+                .into_iter()
+                .map(|change| EditOp::Cell(Box::new(change))),
+        );
+        if edits.is_empty() {
+            self.status_message = Some("nothing to paste".to_string());
+            return;
+        }
+        self.edit_log.record(EditTransaction::from_ops(edits));
+        self.after_structure_edit_parts(&affected, &warnings);
+        self.focus = plan.focus;
+        self.focus.row = self
+            .focus
+            .row
+            .min(self.active_meta_rows().saturating_sub(1));
+        self.focus.col = self
+            .focus
+            .col
+            .min(self.active_meta_cols().saturating_sub(1));
+        self.selection = None;
+        self.mode = Mode::Normal;
+        self.status_message = Some(format!("pasted {cell_count} cell(s)"));
+    }
+
+    pub fn note_clipboard_write(&mut self, text: String, success: bool) {
+        if success {
+            self.registers.note_write_success(text);
+        }
     }
 
     fn submit_search(&mut self) {
@@ -1936,10 +2593,14 @@ impl AppState {
             selection_count: self
                 .selection
                 .map(|selection| {
-                    let range = selection.range(sheet.used_range.end.col + 1);
+                    let range = selection.range(
+                        sheet.used_range.end.row.saturating_add(1),
+                        sheet.used_range.end.col.saturating_add(1),
+                    );
                     (range.row_count() as usize) * (range.col_count() as usize)
                 })
                 .unwrap_or(1),
+            selection_kind: self.selection.map(|selection| selection.mode),
             formula_label: if sheet.formula_overlay.values.is_empty() {
                 String::new()
             } else {
@@ -2112,6 +2773,24 @@ struct FilterSnapshot {
     source: FilterSource,
     enabled: bool,
     columns: Vec<(u32, bool)>,
+}
+
+fn empty_cell() -> Cell {
+    Cell::new(CellValue::Empty, Default::default())
+}
+
+fn transaction_sheets(transaction: &EditTransaction) -> Vec<usize> {
+    let mut sheets: Vec<usize> = transaction
+        .ops
+        .iter()
+        .map(|op| match op {
+            EditOp::Cell(change) => change.sheet,
+            EditOp::Structure(edit) => edit.sheet,
+        })
+        .collect();
+    sheets.sort_unstable();
+    sheets.dedup();
+    sheets
 }
 
 fn snapshot_filters(workbook: &WorkbookModel) -> Vec<FilterSnapshot> {

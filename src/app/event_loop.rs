@@ -215,14 +215,51 @@ fn handle_effect(
     reload: Option<&ReloadHandle>,
 ) -> bool {
     match effect {
-        Effect::WriteClipboard(text) => {
+        Effect::WriteClipboard { text, origin } => {
             match clipboard.write(&text) {
                 Ok(result) => {
+                    if matches!(
+                        origin,
+                        crate::app::action::ClipboardWriteOrigin::Register { .. }
+                    ) {
+                        state.note_clipboard_write(text, true);
+                    }
                     state.status_message =
                         Some(format!("copied {} bytes via {}", result.bytes, result.sink));
                 }
                 Err(error) => {
+                    if matches!(
+                        origin,
+                        crate::app::action::ClipboardWriteOrigin::Register { .. }
+                    ) {
+                        state.note_clipboard_write(text, false);
+                    }
                     state.status_message = Some(format!("copy failed: {error}"));
+                }
+            }
+            false
+        }
+        Effect::ReadClipboard { before, fallback } => {
+            match clipboard.read() {
+                Ok(read) => {
+                    state.paste_clipboard_text(&read.text, before);
+                    if state.status_message.is_none() {
+                        state.status_message = Some(format!("pasted via {}", read.sink));
+                    }
+                }
+                Err(error) => {
+                    if let Some(source) = fallback {
+                        if let Some(block) = state.registers.get(source).cloned() {
+                            state.paste_internal_block(block, before);
+                            state.status_message = Some(format!(
+                                "system clipboard unavailable ({error}); used internal register"
+                            ));
+                        } else {
+                            state.status_message = Some(format!("clipboard read failed: {error}"));
+                        }
+                    } else {
+                        state.status_message = Some(format!("clipboard read failed: {error}"));
+                    }
                 }
             }
             false
@@ -248,20 +285,24 @@ fn handle_effect(
                 state.status_message = Some("no changes to write".to_string());
                 return false;
             }
+            let structural = state.has_structural_changes();
             let Some(workbook) = &mut state.workbook else {
                 state.status_message = Some("no workbook to save".to_string());
                 return false;
             };
             let path = workbook.source.path.clone();
-            if !force && fingerprint(&path) != workbook.source.fingerprint {
-                state.status_message =
-                    Some("file changed on disk; use :w! to overwrite".to_string());
+            let changed = fingerprint(&path) != workbook.source.fingerprint;
+            if changed && (structural || !force) {
+                state.status_message = Some(if structural {
+                    "file changed on disk; reload with :e! before structural save".to_string()
+                } else {
+                    "file changed on disk; use :w! to overwrite".to_string()
+                });
                 return false;
             }
             match xlsx_write::save_workbook(workbook) {
                 Ok(outcome) => {
-                    state.edit_log.reset_after_save();
-                    state.pending_recalc = false;
+                    state.normalize_after_save();
                     let stamp = fingerprint(&path);
                     if let Some(workbook) = &mut state.workbook {
                         workbook.source.fingerprint = stamp;

@@ -58,14 +58,18 @@ pub struct CopySession {
 
 impl CopySession {
     pub fn start(
-        _sheet: &Sheet,
+        sheet: &Sheet,
         selection: &Selection,
         merges: &MergeIndex,
         visibility: &VisibilityMap,
         limits: &CopyLimits,
-        row_cols: u32,
     ) -> Result<Self, CopyError> {
-        let range = selection.range(row_cols);
+        let rows = sheet
+            .meta
+            .row_count
+            .max(sheet.used_range.end.row.saturating_add(1));
+        let cols = sheet.used_range.end.col.saturating_add(1);
+        let range = selection.range(rows, cols);
         let cells = (range.row_count() as usize).saturating_mul(range.col_count() as usize);
         if cells > limits.max_cells {
             return Err(CopyError::TooLarge {

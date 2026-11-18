@@ -7,6 +7,8 @@ use crate::domain::style::{BorderLine, CellStyle, RgbColor};
 pub struct Theme {
     pub mode: ColorMode,
     pub fill_mode: FillMode,
+    /// Base foreground and background for areas without an explicit color.
+    pub base: Style,
     pub selection: Style,
     pub search: Style,
     pub current: Style,
@@ -23,15 +25,53 @@ impl Theme {
     }
 
     pub fn new_with_fill(mode: ColorMode, fill_mode: FillMode) -> Self {
+        let base = if matches!(mode, ColorMode::Mono) {
+            Style::default()
+        } else {
+            Style::default().bg(Color::White).fg(Color::Black)
+        };
         Self {
             mode,
             fill_mode,
+            base,
             selection: Style::default().bg(Color::DarkGray).fg(Color::White),
             search: Style::default().bg(Color::Yellow).fg(Color::Black),
             current: Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
             header: Style::default().add_modifier(Modifier::BOLD),
             border: Style::default().fg(Color::Gray),
             grid: Style::default().fg(Color::DarkGray),
+        }
+    }
+
+    /// Base style for cells that have no explicit foreground or background.
+    pub fn base_style(&self) -> Style {
+        self.base
+    }
+
+    /// Fills reset foreground/background channels in `area` with the base
+    /// palette. Channels are handled independently so widgets that set only a
+    /// foreground (for example grid lines) still receive the base background.
+    pub fn apply_base(&self, buffer: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect) {
+        if matches!(self.mode, ColorMode::Mono) {
+            return;
+        }
+        let Some(fg) = self.base.fg else {
+            return;
+        };
+        let Some(bg) = self.base.bg else {
+            return;
+        };
+        let area = area.intersection(buffer.area);
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                let cell = &mut buffer[(x, y)];
+                if cell.fg == Color::Reset {
+                    cell.fg = fg;
+                }
+                if cell.bg == Color::Reset {
+                    cell.bg = bg;
+                }
+            }
         }
     }
 
@@ -153,6 +193,36 @@ mod tests {
     fn selection_has_a_readable_foreground() {
         let theme = Theme::new(ColorMode::Truecolor);
         assert_eq!(theme.selection.fg, Some(Color::White));
+    }
+
+    #[test]
+    fn non_mono_base_is_white_on_black() {
+        let theme = Theme::new(ColorMode::Truecolor);
+        assert_eq!(theme.base_style().bg, Some(Color::White));
+        assert_eq!(theme.base_style().fg, Some(Color::Black));
+    }
+
+    #[test]
+    fn mono_base_leaves_terminal_defaults() {
+        let theme = Theme::new(ColorMode::Mono);
+        assert_eq!(theme.base_style().bg, None);
+        assert_eq!(theme.base_style().fg, None);
+    }
+
+    #[test]
+    fn apply_base_fills_reset_channels_independently() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let theme = Theme::new(ColorMode::Truecolor);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+        buffer[(0, 0)].fg = Color::Red;
+        buffer[(1, 0)].bg = Color::Blue;
+        theme.apply_base(&mut buffer, Rect::new(0, 0, 2, 1));
+        assert_eq!(buffer[(0, 0)].fg, Color::Red);
+        assert_eq!(buffer[(0, 0)].bg, Color::White);
+        assert_eq!(buffer[(1, 0)].fg, Color::Black);
+        assert_eq!(buffer[(1, 0)].bg, Color::Blue);
     }
 
     #[test]

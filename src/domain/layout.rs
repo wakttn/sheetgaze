@@ -1029,8 +1029,13 @@ fn render_row(
             } else {
                 Vec::new()
             };
-            let selected = selection
-                .is_some_and(|selection| selection.contains(sheet.used_range.end.col + 1, anchor));
+            let selected = selection.is_some_and(|selection| {
+                selection.contains(
+                    sheet.used_range.end.row.saturating_add(1),
+                    sheet.used_range.end.col.saturating_add(1),
+                    anchor,
+                )
+            });
             cells.push(RenderCell {
                 addr: anchor,
                 x,
@@ -1117,8 +1122,13 @@ fn render_row(
                 style,
             }];
         }
-        let selected = selection
-            .is_some_and(|selection| selection.contains(sheet.used_range.end.col + 1, addr));
+        let selected = selection.is_some_and(|selection| {
+            selection.contains(
+                sheet.used_range.end.row.saturating_add(1),
+                sheet.used_range.end.col.saturating_add(1),
+                addr,
+            )
+        });
         let cursor = focus == addr;
         cells.push(RenderCell {
             addr,

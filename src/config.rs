@@ -39,6 +39,17 @@ pub enum ClipboardMode {
     None,
 }
 
+/// Which register `p` / `P` read by default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum ClipboardRegisterMode {
+    /// Vim's `clipboard=unnamedplus`: read the system clipboard and fall back
+    /// to the internal register when reading is unavailable.
+    #[default]
+    UnnamedPlus,
+    /// Use only the in-app unnamed register by default.
+    Internal,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum LazyMode {
     #[default]
@@ -110,6 +121,9 @@ pub struct Cli {
     pub fill_mode: FillMode,
     #[arg(long, value_enum, default_value_t = ClipboardMode::Auto)]
     pub clipboard: ClipboardMode,
+    /// Register used by p / P: unnamedplus reads the system clipboard first.
+    #[arg(long, value_enum, default_value_t = ClipboardRegisterMode::UnnamedPlus)]
+    pub clipboard_register: ClipboardRegisterMode,
     #[arg(long)]
     pub encoding: Option<String>,
     #[arg(long, value_enum, default_value_t = LazyMode::Auto)]
@@ -141,6 +155,9 @@ pub struct Cli {
     pub watch_interval_ms: u64,
     #[arg(long, default_value_t = 200_000)]
     pub max_copy_cells: usize,
+    /// Maximum number of cells that may be materialized for structural editing.
+    #[arg(long, default_value_t = 500_000)]
+    pub structural_max_cells: u64,
     #[arg(long, default_value_t = 262_144)]
     pub osc52_max_bytes: usize,
 }
@@ -180,6 +197,7 @@ impl Default for Config {
             color: ColorMode::Auto,
             fill_mode: FillMode::Background,
             clipboard: ClipboardMode::Auto,
+            clipboard_register: ClipboardRegisterMode::UnnamedPlus,
             encoding: None,
             lazy: LazyMode::Auto,
             lazy_threshold_cells: 200_000,
@@ -195,6 +213,7 @@ impl Default for Config {
             watch: WatchModeArg::Poll,
             watch_interval_ms: 1_000,
             max_copy_cells: 200_000,
+            structural_max_cells: 500_000,
             osc52_max_bytes: 262_144,
         };
         Self {
@@ -228,6 +247,9 @@ impl Config {
         }
         if !(100..=60_000).contains(&cli.watch_interval_ms) {
             return Err("--watch-interval-ms must be between 100 and 60000".to_string());
+        }
+        if !(1_000..=10_000_000).contains(&cli.structural_max_cells) {
+            return Err("--structural-max-cells must be between 1000 and 10000000".to_string());
         }
         if let Some(width) = cli.width
             && !(40..=1000).contains(&width)
@@ -363,6 +385,33 @@ mod tests {
         let config = Config::from_cli(cli).unwrap();
         assert!(config.cli.fit_width);
         assert_eq!(config.layout_mode, LayoutMode::Content);
+    }
+
+    #[test]
+    fn clipboard_register_defaults_to_unnamedplus() {
+        assert_eq!(
+            Config::default().cli.clipboard_register,
+            ClipboardRegisterMode::UnnamedPlus
+        );
+        let cli =
+            Cli::try_parse_from(["sheetgaze", "--clipboard-register", "internal", "book.xlsx"])
+                .unwrap();
+        assert_eq!(cli.clipboard_register, ClipboardRegisterMode::Internal);
+    }
+
+    #[test]
+    fn structural_max_cells_must_be_in_range() {
+        let mut cli = Config::default().cli;
+        cli.structural_max_cells = 999;
+        assert!(Config::from_cli(cli).is_err());
+
+        let mut cli = Config::default().cli;
+        cli.structural_max_cells = 10_000_001;
+        assert!(Config::from_cli(cli).is_err());
+
+        let mut cli = Config::default().cli;
+        cli.structural_max_cells = 1_000;
+        assert!(Config::from_cli(cli).is_ok());
     }
 
     #[test]

@@ -15,7 +15,13 @@ pub fn status_line(view: &ScreenView) -> String {
         parts.push(status.fit_label.clone());
     }
     if status.selection_count > 1 {
-        parts.push(format!("sel:{}", status.selection_count));
+        let kind = match status.selection_kind {
+            Some(crate::domain::selection::SelectionMode::Row) => "line",
+            Some(crate::domain::selection::SelectionMode::Column) => "col",
+            Some(crate::domain::selection::SelectionMode::Block) => "block",
+            _ => "sel",
+        };
+        parts.push(format!("{kind}:{}", status.selection_count));
     }
     if !status.formula_label.is_empty() {
         parts.push(status.formula_label.clone());
