@@ -237,6 +237,11 @@ impl WorkbookModel {
             if !invalidation.rows.is_empty() || !invalidation.columns.is_empty() {
                 summary.layout_changed = true;
             }
+            if let Some(region) = sheet.merges.region_at(update.addr).copied() {
+                sheet.refresh_wrap_merge(region);
+            } else {
+                sheet.refresh_wrap_row(update.addr.row);
+            }
             if !sheet.filters.is_empty() {
                 sheet.invalidate_filter_masks();
                 summary.filter_masks_dirty = true;

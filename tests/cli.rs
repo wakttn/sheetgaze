@@ -114,6 +114,27 @@ fn print_mode_applies_fit_width() {
 }
 
 #[test]
+fn print_mode_wraps_explicit_width_overflow() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/xlsx/excel_width_wrap.xlsx");
+    let output = cmd()
+        .args(["--print", "--no-ansi", "--width", "80", "--height", "30"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("012345678901234"),
+        "wrapped line missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("blocked"),
+        "neighbour value missing: {stdout}"
+    );
+}
+
+#[test]
 fn print_mode_emits_ansi_by_default() {
     let (_dir, path) = csv_fixture("Name,Value\nEast,10\n");
     let output = cmd()

@@ -16,6 +16,7 @@
 - Edit xlsx cell values and formulas with Vim-style modal keys, undo / redo, and atomic OOXML save that preserves styles, merges, filters, and other workbook parts
 - Recalculate formulas from unsaved edits using a temporary patched workbook
 - Prefer explicit Excel column widths and row heights, with content-based auto-fit for unspecified cells and configurable caps (`--layout`)
+- Wrap long single-line values inside explicit Excel column widths when they cannot fully spill, expanding the row up to `--max-row-lines`
 - Toggle fit-to-width mode with `w` or start in it with `--fit-width`, proportionally shrinking all used columns into the terminal width
 - Lazy row loading with an LRU row cache for large files
 - Copy a cell or range as TSV via OSC 52 (system clipboard is an optional feature)
@@ -122,7 +123,7 @@ Editing is available for xlsx files. CSV and `--read-only` workbooks remain read
 
 ## Fixtures
 
-`tests/fixtures/xlsx/` contains 21 generated workbooks covering values, formulas, styles, borders, merges, newlines, overflow, explicit Excel layouts, 100x100 freeze panes, worksheet/table filters, warning cases, multiple sheets, sparse data, special characters, and a 6,001-row lazy-load file.
+`tests/fixtures/xlsx/` contains 22 generated workbooks covering values, formulas, styles, borders, merges, newlines, overflow, explicit Excel layouts, explicit-width wrapping, 100x100 freeze panes, worksheet/table filters, warning cases, multiple sheets, sparse data, special characters, and a 6,001-row lazy-load file.
 
 ```bash
 cargo test --test generate_fixtures -- --ignored --nocapture
@@ -176,7 +177,8 @@ produce a half-populated public release.
 
 - Automatic reload compares the file's existence, size, and modification time only; a rewrite that preserves both size and mtime is not detected. Use `r` in that case.
 - Search matching runs synchronously; formula recalculation runs in a background thread.
-- Fit-to-width mode shrinks columns only; row heights are not recalculated, so wrapped cells may be truncated with `…` until the mode is turned off.
+- Fit-to-width mode shrinks columns only; row heights are not recalculated, so wrapped cells may be truncated with `…` until the mode is turned off. The extra row heights computed for explicit Excel column widths are ignored in fit-to-width mode.
+- Text wrapped inside explicit Excel column widths is capped at `--max-row-lines` (default 10); longer values end with `…` and can be read in full in the cell detail view.
 - If even one-character columns cannot fit, fit-to-width stays at maximum compression, reports `fit:limited`, and keeps horizontal scrolling.
 - CSV decoding currently reads the source file into memory before writing the UTF-8 spill file; row access is lazy after that.
 - Multi-row merged cells distribute wrapped text across the merged rows; a merged range that starts left of the viewport is not partially clipped yet.

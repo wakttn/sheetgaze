@@ -20,7 +20,7 @@ impl ViewportPlanner {
         widths: &ColumnWidths,
     ) -> ViewportPlan {
         let focus = sheet.merges.anchor_for(focus);
-        let top_visible_row = Self::vertical(sheet, viewport, focus, freeze);
+        let top_visible_row = Self::vertical(sheet, viewport, focus, freeze, widths);
         let left_col = Self::horizontal(sheet, viewport, focus, freeze, widths);
         ViewportPlan {
             top_visible_row,
@@ -33,6 +33,7 @@ impl ViewportPlanner {
         viewport: &Viewport,
         focus: CellAddr,
         freeze: EffectiveFreeze,
+        widths: &ColumnWidths,
     ) -> u32 {
         if focus.row < freeze.rows {
             return 0;
@@ -71,14 +72,14 @@ impl ViewportPlanner {
             .filter(|last| *last >= first)
             .unwrap_or(first);
         let frozen_height: u32 = (0..freeze.rows)
-            .map(|row| row_height(sheet, row))
+            .map(|row| row_height(sheet, row, widths))
             .sum::<u32>()
             .min(viewport.height as u32);
         let available = (viewport.height as u32)
             .saturating_sub(frozen_height)
             .max(1) as usize;
         let span_height: u32 = (first..=last)
-            .map(|index| row_height(sheet, scrollable[index]))
+            .map(|index| row_height(sheet, scrollable[index], widths))
             .sum();
         let target_end = if span_height as usize <= available {
             last
@@ -96,13 +97,13 @@ impl ViewportPlanner {
         // occupy more than one terminal line.
         if target_end >= top {
             let used: u32 = (top..=target_end)
-                .map(|index| row_height(sheet, scrollable[index]))
+                .map(|index| row_height(sheet, scrollable[index], widths))
                 .sum();
             if used > available as u32 {
                 let mut candidate = target_end;
-                let mut height = row_height(sheet, scrollable[candidate]);
+                let mut height = row_height(sheet, scrollable[candidate], widths);
                 while candidate > 0 {
-                    let previous = row_height(sheet, scrollable[candidate - 1]);
+                    let previous = row_height(sheet, scrollable[candidate - 1], widths);
                     if height + previous > available as u32 {
                         break;
                     }
@@ -166,12 +167,6 @@ fn slot_width(widths: &ColumnWidths, col: u32) -> u16 {
     widths.width(col).saturating_add(CELL_GUTTER)
 }
 
-fn row_height(sheet: &Sheet, row: u32) -> u32 {
-    sheet
-        .layout
-        .row_heights
-        .get(row as usize)
-        .copied()
-        .unwrap_or(1)
-        .max(1) as u32
+fn row_height(sheet: &Sheet, row: u32, widths: &ColumnWidths) -> u32 {
+    sheet.layout.display_row_height(row, widths.xlsx_priority()) as u32
 }

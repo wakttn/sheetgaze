@@ -12,7 +12,7 @@ use crate::domain::merge::MergeIndex;
 use crate::domain::search::SearchIndex;
 use crate::domain::selection::Selection;
 use crate::domain::sheet::{Sheet, SheetData};
-use crate::domain::style::CellStyle;
+use crate::domain::style::{CellBorders, CellStyle};
 
 #[derive(Clone, Copy, Debug)]
 pub struct LayoutLimits {
@@ -93,6 +93,9 @@ pub struct LayoutSnapshot {
     pub fixed_columns: BTreeSet<u32>,
     /// Rows whose size comes from an explicit Excel `customHeight`.
     pub fixed_rows: BTreeSet<u32>,
+    /// Extra row height needed to show text wrapped inside explicit Excel
+    /// column widths. Only used while the xlsx width priority mode is active.
+    pub wrap_row_heights: BTreeMap<u32, u8>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -198,6 +201,7 @@ impl LayoutStatsBuilder {
         );
 
         let mut fixed_columns = BTreeSet::new();
+        let mut wrap_row_heights: BTreeMap<u32, u8> = BTreeMap::new();
         if let Some(excel) = excel {
             for (&col, &width) in &excel.column_widths {
                 let index = col as usize;
@@ -277,6 +281,23 @@ impl LayoutStatsBuilder {
                     .max(per_row)
                     .min(limits.max_row_lines as u8);
             }
+            if !demand.wrap_text
+                && !demand.display.contains('\n')
+                && demand.range.cols().any(|col| fixed_columns.contains(&col))
+                && UnicodeWidthStr::width(demand.display.as_str()) > total_width as usize
+            {
+                let lines =
+                    wrapped_line_count(&demand.display, total_width.min(u16::MAX as u32) as u16)
+                        .min(limits.max_row_lines as u8)
+                        .max(1) as u32;
+                let per_row = lines.div_ceil(rows).max(1) as u8;
+                for row in demand.range.rows() {
+                    wrap_row_heights
+                        .entry(row)
+                        .and_modify(|height| *height = (*height).max(per_row))
+                        .or_insert(per_row);
+                }
+            }
         }
         for demand in &self.wrap_demands {
             let addr = CellAddr::new(demand.row, demand.col);
@@ -318,6 +339,7 @@ impl LayoutStatsBuilder {
             row_heights: heights,
             fixed_columns,
             fixed_rows,
+            wrap_row_heights,
         }
     }
 }
@@ -345,6 +367,133 @@ pub fn wrapped_line_count(display: &str, width: u16) -> u8 {
         lines = lines.saturating_add(count.min(u8::MAX as usize) as u8);
     }
     lines.max(1)
+}
+
+/// Horizontal area available to a single-line cell after spilling into empty
+/// neighbours. `spilled` is true when at least one neighbouring cell was
+/// included.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OverflowSpan {
+    pub width: u16,
+    pub spilled: bool,
+}
+
+/// The parts of a neighbouring cell that affect horizontal overflow.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OverflowSlot {
+    pub empty: bool,
+    pub left_border: bool,
+    pub right_border: bool,
+}
+
+impl OverflowSlot {
+    pub fn from_cell(cell: &Cell) -> Self {
+        Self {
+            empty: cell.raw.is_empty() && cell.display.is_empty(),
+            left_border: cell.style.borders.left.is_visible(),
+            right_border: cell.style.borders.right.is_visible(),
+        }
+    }
+
+    pub fn from_effective(cell: &EffectiveCell) -> Self {
+        Self {
+            empty: cell.value.is_empty() && cell.display.is_empty(),
+            left_border: cell.style.borders.left.is_visible(),
+            right_border: cell.style.borders.right.is_visible(),
+        }
+    }
+}
+
+/// Computes the existing single-line horizontal overflow area for a cell.
+/// This mirrors the rules used by the grid: extend into empty neighbours,
+/// stop before values, merges, or left borders, and stop after a right border.
+#[allow(clippy::too_many_arguments)]
+pub fn overflow_span(
+    row: u32,
+    col: u32,
+    own_width: u16,
+    own_right_border: bool,
+    used_end_col: u32,
+    merges: &MergeIndex,
+    width_of: impl Fn(u32) -> u16,
+    slot_at: impl Fn(u32) -> Option<OverflowSlot>,
+) -> OverflowSpan {
+    if own_right_border {
+        return OverflowSpan {
+            width: own_width,
+            spilled: false,
+        };
+    }
+    let mut width = own_width;
+    let mut spilled = false;
+    let mut next = col.saturating_add(1);
+    while next <= used_end_col && !merges.is_blocker(CellAddr::new(row, next)) {
+        let Some(slot) = slot_at(next) else {
+            width = width
+                .saturating_add(width_of(next))
+                .saturating_add(CELL_GUTTER);
+            spilled = true;
+            next = next.saturating_add(1);
+            continue;
+        };
+        if !slot.empty || slot.left_border {
+            break;
+        }
+        width = width
+            .saturating_add(width_of(next))
+            .saturating_add(if slot.right_border { 0 } else { CELL_GUTTER });
+        spilled = true;
+        if slot.right_border {
+            break;
+        }
+        next = next.saturating_add(1);
+    }
+    OverflowSpan { width, spilled }
+}
+
+/// Number of wrapped lines needed to show `display` in the horizontal area
+/// available to the cell, when the value is a single-line, non-`wrap_text`
+/// value that does not fit in that area. Returns `None` when the cell does
+/// not need the explicit-width wrapping treatment.
+#[allow(clippy::too_many_arguments)]
+pub fn overflow_wrap_lines(
+    display: &str,
+    wrap_text: bool,
+    row: u32,
+    col: u32,
+    own_width: u16,
+    own_borders: CellBorders,
+    used_end_col: u32,
+    merges: &MergeIndex,
+    limits: &LayoutLimits,
+    width_of: impl Fn(u32) -> u16,
+    slot_at: impl Fn(u32) -> Option<OverflowSlot>,
+) -> Option<u8> {
+    if wrap_text || display.contains('\n') {
+        return None;
+    }
+    let display_width = UnicodeWidthStr::width(display);
+    if display_width <= own_width as usize {
+        return None;
+    }
+    let span = overflow_span(
+        row,
+        col,
+        own_width,
+        own_borders.right.is_visible(),
+        used_end_col,
+        merges,
+        width_of,
+        slot_at,
+    );
+    if display_width <= span.width as usize {
+        return None;
+    }
+    Some(
+        wrapped_line_count(display, span.width)
+            .min(limits.max_row_lines as u8)
+            .max(1),
+    )
 }
 
 /// Whether a display string is truncated when only `rendered_lines` lines are
@@ -452,6 +601,9 @@ pub struct StyledSpan {
 pub struct ColumnWidths {
     widths: Vec<u16>,
     limited: bool,
+    /// True when these widths come from the sheet's xlsx layout. In that mode
+    /// explicit-width columns wrap overflowing text instead of truncating it.
+    xlsx_priority: bool,
 }
 
 /// Result of scaling column widths into an available viewport width.
@@ -480,6 +632,7 @@ impl ColumnWidths {
         Self {
             widths,
             limited: false,
+            xlsx_priority: true,
         }
     }
 
@@ -489,6 +642,7 @@ impl ColumnWidths {
         Self {
             widths: fitted.widths,
             limited: fitted.limited,
+            xlsx_priority: false,
         }
     }
 
@@ -505,6 +659,10 @@ impl ColumnWidths {
 
     pub fn limited(&self) -> bool {
         self.limited
+    }
+
+    pub fn xlsx_priority(&self) -> bool {
+        self.xlsx_priority
     }
 }
 
@@ -616,7 +774,7 @@ impl LayoutEngine {
         let mut height = 0u16;
         let max_frozen_height = viewport.height.saturating_sub(3);
         for row in 0..requested_rows {
-            let next = row_height(&sheet.layout, row);
+            let next = row_height(&sheet.layout, row, widths);
             if height.saturating_add(next) > max_frozen_height {
                 break;
             }
@@ -657,7 +815,7 @@ impl LayoutEngine {
         let mut scroll = Vec::new();
         let mut used_height = 0u16;
         for row in 0..freeze.rows {
-            let height = row_height(layout, row);
+            let height = row_height(layout, row, widths);
             if used_height + height > viewport.height {
                 break;
             }
@@ -681,7 +839,7 @@ impl LayoutEngine {
             .collect();
         let start = viewport.top_visible_row as usize;
         for row in scrollable.into_iter().skip(start) {
-            let height = row_height(layout, row);
+            let height = row_height(layout, row, widths);
             if used_height + height > viewport.height {
                 break;
             }
@@ -725,61 +883,21 @@ impl LayoutEngine {
         {
             style.borders = *borders;
         }
-        let base_width = if let Some(region) = merge {
-            let cols = region.range.col_count().max(1) as u16;
-            region
-                .range
-                .cols()
-                .map(|col| widths.width(col))
-                .sum::<u16>()
-                .saturating_add(cols.saturating_sub(1) * CELL_GUTTER)
-        } else {
-            widths.width(addr.col)
-        };
-        let mut width = base_width;
-        let mut overflow = false;
-        let single_line = !effective.display.contains('\n') && !style.wrap_text;
-        if single_line
-            && !style.borders.right.is_visible()
-            && UnicodeWidthStr::width(effective.display.as_str()) > width as usize
-        {
-            let mut next = addr.col + 1;
-            while next <= sheet.used_range.end.col
-                && !sheet.merges.is_blocker(CellAddr::new(addr.row, next))
-            {
-                let next_cell = sheet.effective_cell(CellAddr::new(addr.row, next));
-                if next_cell.as_ref().is_some_and(|cell| !cell.is_empty()) {
-                    break;
-                }
-                let next_borders = next_cell
-                    .as_ref()
-                    .map(|cell| cell.style.borders)
-                    .unwrap_or_default();
-                if next_borders.left.is_visible() {
-                    break;
-                }
-                let next_width = widths.width(next);
-                width = width.saturating_add(next_width).saturating_add(
-                    if next_borders.right.is_visible() {
-                        0
-                    } else {
-                        CELL_GUTTER
-                    },
-                );
-                overflow = true;
-                if next_borders.right.is_visible() {
-                    break;
-                }
-                next += 1;
-            }
-        }
+        let plan = text_plan(
+            sheet,
+            addr,
+            &effective.display,
+            style,
+            merge.map(|region| region.range),
+            widths,
+        );
         let height = if let Some(region) = merge {
-            merge_total_height(layout, region.range) as usize
+            merge_total_height(layout, region.range, widths) as usize
         } else {
-            row_height(layout, addr.row) as usize
+            row_height(layout, addr.row, widths) as usize
         };
-        let mut lines = wrap_display(&effective.display, style.wrap_text, width, height);
-        let truncated = is_truncated(&effective.display, style.wrap_text, width, lines.len());
+        let mut lines = wrap_display(&effective.display, plan.wrap, plan.width, height);
+        let truncated = is_truncated(&effective.display, plan.wrap, plan.width, lines.len());
         if truncated && let Some(last) = lines.last_mut() {
             let text = last
                 .spans
@@ -787,7 +905,7 @@ impl LayoutEngine {
                 .map(|span| span.text.clone())
                 .unwrap_or_default();
             let mut clipped = text;
-            while UnicodeWidthStr::width(clipped.as_str()) + 1 > width as usize
+            while UnicodeWidthStr::width(clipped.as_str()) + 1 > plan.width as usize
                 && !clipped.is_empty()
             {
                 clipped.pop();
@@ -801,11 +919,11 @@ impl LayoutEngine {
         CellMeasure {
             addr,
             x: 0,
-            base_width,
-            width,
+            base_width: plan.base_width,
+            width: plan.width,
             lines,
             style,
-            overflow,
+            overflow: plan.overflow,
             truncated,
             merge_span: merge.map(|region| region.range),
         }
@@ -817,6 +935,35 @@ impl LayoutEngine {
 }
 
 impl LayoutSnapshot {
+    pub fn base_row_height(&self, row: u32) -> u16 {
+        self.row_heights
+            .get(row as usize)
+            .copied()
+            .unwrap_or(1)
+            .max(1) as u16
+    }
+
+    /// Row height used for display. In xlsx width priority mode this includes
+    /// the extra height needed to wrap text inside explicit Excel columns.
+    pub fn display_row_height(&self, row: u32, xlsx_priority: bool) -> u16 {
+        let height = self.base_row_height(row);
+        if xlsx_priority {
+            height.max(self.wrap_row_heights.get(&row).copied().unwrap_or(0) as u16)
+        } else {
+            height
+        }
+    }
+
+    pub fn grow_wrap_height(&mut self, row: u32, lines: u8) {
+        if lines <= 1 {
+            return;
+        }
+        self.wrap_row_heights
+            .entry(row)
+            .and_modify(|height| *height = (*height).max(lines))
+            .or_insert(lines);
+    }
+
     pub fn grow_for_cell(
         &mut self,
         addr: CellAddr,
@@ -906,13 +1053,8 @@ fn plan_columns(
     columns
 }
 
-fn row_height(layout: &LayoutSnapshot, row: u32) -> u16 {
-    layout
-        .row_heights
-        .get(row as usize)
-        .copied()
-        .unwrap_or(1)
-        .max(1) as u16
+fn row_height(layout: &LayoutSnapshot, row: u32, widths: &ColumnWidths) -> u16 {
+    layout.display_row_height(row, widths.xlsx_priority())
 }
 
 fn merged_width(widths: &ColumnWidths, range: CellRange) -> u16 {
@@ -924,18 +1066,92 @@ fn merged_width(widths: &ColumnWidths, range: CellRange) -> u16 {
         .saturating_add(cols.saturating_sub(1) * CELL_GUTTER)
 }
 
-fn merge_total_height(layout: &LayoutSnapshot, range: CellRange) -> u16 {
+#[derive(Clone, Copy, Debug, Default)]
+struct TextPlan {
+    base_width: u16,
+    width: u16,
+    overflow: bool,
+    wrap: bool,
+}
+
+/// Plans the horizontal area and wrapping for one cell. Explicit-width
+/// columns in xlsx width priority mode wrap only when the full value does not
+/// fit in the area it could otherwise spill into.
+fn text_plan(
+    sheet: &Sheet,
+    addr: CellAddr,
+    display: &str,
+    style: CellStyle,
+    merge: Option<CellRange>,
+    widths: &ColumnWidths,
+) -> TextPlan {
+    let base_width = merge.map_or_else(
+        || widths.width(addr.col),
+        |range| merged_width(widths, range),
+    );
+    let target = widths.xlsx_priority()
+        && match merge {
+            Some(range) => range
+                .cols()
+                .any(|col| sheet.layout.fixed_columns.contains(&col)),
+            None => sheet.layout.fixed_columns.contains(&addr.col),
+        };
+    let single_line = !display.contains('\n') && !style.wrap_text;
+    let display_width = UnicodeWidthStr::width(display);
+    let mut plan = TextPlan {
+        base_width,
+        width: base_width,
+        overflow: false,
+        wrap: style.wrap_text,
+    };
+    if !single_line || display_width <= base_width as usize {
+        return plan;
+    }
+    if merge.is_some() {
+        if target {
+            plan.wrap = true;
+        }
+        return plan;
+    }
+    let span = overflow_span(
+        addr.row,
+        addr.col,
+        base_width,
+        style.borders.right.is_visible(),
+        sheet.used_range.end.col,
+        &sheet.merges,
+        |col| widths.width(col),
+        |col| {
+            sheet
+                .effective_cell(CellAddr::new(addr.row, col))
+                .map(|cell| OverflowSlot::from_effective(&cell))
+        },
+    );
+    plan.width = span.width;
+    plan.overflow = span.spilled;
+    if target && display_width > span.width as usize {
+        plan.wrap = true;
+    }
+    plan
+}
+
+fn merge_total_height(layout: &LayoutSnapshot, range: CellRange, widths: &ColumnWidths) -> u16 {
     range
         .rows()
-        .map(|row| row_height(layout, row))
+        .map(|row| row_height(layout, row, widths))
         .fold(0u16, u16::saturating_add)
 }
 
-fn merge_line_offset(layout: &LayoutSnapshot, range: CellRange, row: u32) -> u16 {
+fn merge_line_offset(
+    layout: &LayoutSnapshot,
+    range: CellRange,
+    row: u32,
+    widths: &ColumnWidths,
+) -> u16 {
     range
         .rows()
         .take_while(|candidate| *candidate < row)
-        .map(|candidate| row_height(layout, candidate))
+        .map(|candidate| row_height(layout, candidate, widths))
         .fold(0u16, u16::saturating_add)
 }
 
@@ -951,7 +1167,7 @@ fn render_row(
     widths: &ColumnWidths,
 ) -> RenderRow {
     let layout = &sheet.layout;
-    let height = row_height(layout, row);
+    let height = row_height(layout, row, widths);
     let mut cells = Vec::new();
     let mut x = 0u16;
     let mut cols = Vec::new();
@@ -982,8 +1198,8 @@ fn render_row(
 
             let anchor = region.anchor;
             let width = merged_width(widths, region.range);
-            let total_height = merge_total_height(layout, region.range) as usize;
-            let line_offset = merge_line_offset(layout, region.range, row) as usize;
+            let total_height = merge_total_height(layout, region.range, widths) as usize;
+            let line_offset = merge_line_offset(layout, region.range, row, widths) as usize;
             let effective = sheet
                 .effective_cell(anchor)
                 .unwrap_or_else(|| EffectiveCell {
@@ -998,13 +1214,21 @@ fn render_row(
                 style.borders = *borders;
             }
 
+            let plan = text_plan(
+                sheet,
+                anchor,
+                &effective.display,
+                style,
+                Some(region.range),
+                widths,
+            );
             let mut lines = wrap_display(
                 &effective.display,
-                style.wrap_text,
-                width,
+                plan.wrap,
+                plan.width,
                 total_height.max(1),
             );
-            let truncated = is_truncated(&effective.display, style.wrap_text, width, lines.len());
+            let truncated = is_truncated(&effective.display, plan.wrap, plan.width, lines.len());
             if truncated && let Some(last) = lines.last_mut() {
                 let text = last
                     .spans
@@ -1012,7 +1236,7 @@ fn render_row(
                     .map(|span| span.text.clone())
                     .unwrap_or_default();
                 let mut clipped = text;
-                while UnicodeWidthStr::width(clipped.as_str()) + 1 > width as usize
+                while UnicodeWidthStr::width(clipped.as_str()) + 1 > plan.width as usize
                     && !clipped.is_empty()
                 {
                     clipped.pop();
@@ -1064,46 +1288,10 @@ fn render_row(
             formula_status: FormulaStatus::Pending,
         });
         let style = effective.style;
-        let mut cell_width = width;
-        let mut overflow = false;
-        let single_line = !effective.display.contains('\n') && !style.wrap_text;
-        if single_line
-            && !style.borders.right.is_visible()
-            && UnicodeWidthStr::width(effective.display.as_str()) > cell_width as usize
-        {
-            let mut next = col + 1;
-            while next <= sheet.used_range.end.col
-                && !sheet.merges.is_blocker(CellAddr::new(row, next))
-            {
-                let next_cell = sheet.effective_cell(CellAddr::new(row, next));
-                if next_cell.as_ref().is_some_and(|cell| !cell.is_empty()) {
-                    break;
-                }
-                let next_borders = next_cell
-                    .as_ref()
-                    .map(|cell| cell.style.borders)
-                    .unwrap_or_default();
-                if next_borders.left.is_visible() {
-                    break;
-                }
-                let next_width = widths.width(next);
-                cell_width = cell_width.saturating_add(next_width).saturating_add(
-                    if next_borders.right.is_visible() {
-                        0
-                    } else {
-                        CELL_GUTTER
-                    },
-                );
-                overflow = true;
-                if next_borders.right.is_visible() {
-                    break;
-                }
-                next += 1;
-            }
-        }
+        let plan = text_plan(sheet, addr, &effective.display, style, None, widths);
         let max_lines = height as usize;
-        let mut lines = wrap_display(&effective.display, style.wrap_text, cell_width, max_lines);
-        let truncated = is_truncated(&effective.display, style.wrap_text, cell_width, lines.len());
+        let mut lines = wrap_display(&effective.display, plan.wrap, plan.width, max_lines);
+        let truncated = is_truncated(&effective.display, plan.wrap, plan.width, lines.len());
         if truncated && let Some(last) = lines.last_mut() {
             let text = last
                 .spans
@@ -1111,7 +1299,7 @@ fn render_row(
                 .map(|span| span.text.clone())
                 .unwrap_or_default();
             let mut clipped = text;
-            while UnicodeWidthStr::width(clipped.as_str()) + 1 > cell_width as usize
+            while UnicodeWidthStr::width(clipped.as_str()) + 1 > plan.width as usize
                 && !clipped.is_empty()
             {
                 clipped.pop();
@@ -1133,11 +1321,11 @@ fn render_row(
         cells.push(RenderCell {
             addr,
             x,
-            width: cell_width,
-            slot_width: width,
+            width: plan.width,
+            slot_width: plan.base_width,
             lines,
             style,
-            overflow,
+            overflow: plan.overflow,
             truncated,
             selected,
             cursor,
@@ -1243,6 +1431,24 @@ mod tests {
     }
 
     #[test]
+    fn merge_with_fixed_columns_adds_wrap_height() {
+        let limits = LayoutLimits::default();
+        let mut builder = LayoutStatsBuilder::new(&limits);
+        let range = CellRange::new(CellAddr::new(0, 0), CellAddr::new(0, 1));
+        builder.observe_merge(range, &"0123456789".repeat(4), false);
+        let excel = ExcelLayout {
+            column_widths: BTreeMap::from([(0, 6.0), (1, 8.0)]),
+            ..ExcelLayout::default()
+        };
+        let layout = builder.finish(&MergeIndex::empty(), Some(&excel), used(0, 1));
+        assert_eq!(layout.column_widths[0], 6);
+        assert_eq!(layout.column_widths[1], 8);
+        assert_eq!(layout.wrap_row_heights.get(&0), Some(&3));
+        assert_eq!(layout.display_row_height(0, true), 3);
+        assert_eq!(layout.display_row_height(0, false), 1);
+    }
+
+    #[test]
     fn explicit_row_height_replaces_wrapped_height() {
         let limits = LayoutLimits::default();
         let mut builder = LayoutStatsBuilder::new(&limits);
@@ -1298,6 +1504,7 @@ mod tests {
             row_heights: vec![1, 1],
             fixed_columns: BTreeSet::from([0]),
             fixed_rows: BTreeSet::from([0]),
+            wrap_row_heights: BTreeMap::new(),
         };
 
         layout.grow_for_cell(CellAddr::new(0, 0), &"x".repeat(50), false, None, &limits);
@@ -1313,6 +1520,156 @@ mod tests {
         );
         assert!(layout.column_widths[1] > 10);
         assert!(layout.row_heights[1] > 1);
+    }
+
+    #[test]
+    fn overflow_span_stops_at_values_borders_merges_and_used_end() {
+        let merges = MergeIndex::empty();
+        let widths = [6u16, 8, 10];
+        let width = |col: u32| widths[col as usize];
+
+        assert_eq!(
+            overflow_span(0, 0, 6, false, 2, &merges, width, |_| None),
+            OverflowSpan {
+                width: 26,
+                spilled: true
+            }
+        );
+        assert_eq!(
+            overflow_span(0, 0, 6, false, 0, &merges, width, |_| None),
+            OverflowSpan {
+                width: 6,
+                spilled: false
+            }
+        );
+        assert_eq!(
+            overflow_span(0, 0, 6, true, 2, &merges, width, |_| None),
+            OverflowSpan {
+                width: 6,
+                spilled: false
+            }
+        );
+
+        let value = |col: u32| {
+            (col == 1).then_some(OverflowSlot {
+                empty: false,
+                left_border: false,
+                right_border: false,
+            })
+        };
+        assert_eq!(
+            overflow_span(0, 0, 6, false, 2, &merges, width, value).width,
+            6
+        );
+
+        let left_border = |col: u32| {
+            (col == 1).then_some(OverflowSlot {
+                empty: true,
+                left_border: true,
+                right_border: false,
+            })
+        };
+        assert_eq!(
+            overflow_span(0, 0, 6, false, 2, &merges, width, left_border).width,
+            6
+        );
+
+        let right_border = |col: u32| {
+            (col == 1).then_some(OverflowSlot {
+                empty: true,
+                left_border: false,
+                right_border: true,
+            })
+        };
+        assert_eq!(
+            overflow_span(0, 0, 6, false, 2, &merges, width, right_border),
+            OverflowSpan {
+                width: 14,
+                spilled: true
+            }
+        );
+
+        let merge_merges = MergeIndex::new(vec![crate::domain::merge::MergeRegion {
+            anchor: CellAddr::new(0, 1),
+            range: CellRange::new(CellAddr::new(0, 1), CellAddr::new(0, 1)),
+        }]);
+        assert_eq!(
+            overflow_span(0, 0, 6, false, 2, &merge_merges, width, |_| None).width,
+            6
+        );
+    }
+
+    #[test]
+    fn overflow_wrap_lines_requires_a_blocked_single_line_value() {
+        let limits = LayoutLimits::default();
+        let merges = MergeIndex::empty();
+        let borders = CellBorders::default();
+        let widths = |col: u32| [6u16, 8, 10][col as usize];
+        let blocked = |col: u32| {
+            (col == 1).then_some(OverflowSlot {
+                empty: false,
+                left_border: false,
+                right_border: false,
+            })
+        };
+        let empty = |_| None;
+
+        let long = "0123456789".repeat(4);
+        assert_eq!(
+            overflow_wrap_lines(
+                &long, false, 0, 0, 6, borders, 2, &merges, &limits, widths, blocked
+            ),
+            Some(7)
+        );
+        assert_eq!(
+            overflow_wrap_lines(
+                "0123456789ab",
+                false,
+                0,
+                0,
+                6,
+                borders,
+                2,
+                &merges,
+                &limits,
+                widths,
+                empty,
+            ),
+            None
+        );
+        assert_eq!(
+            overflow_wrap_lines(
+                &long, true, 0, 0, 6, borders, 2, &merges, &limits, widths, blocked
+            ),
+            None
+        );
+        assert_eq!(
+            overflow_wrap_lines(
+                "a\nb", false, 0, 0, 6, borders, 2, &merges, &limits, widths, blocked
+            ),
+            None
+        );
+
+        let very_long = "0123456789".repeat(20);
+        let wrapped = overflow_wrap_lines(
+            &very_long, false, 0, 0, 6, borders, 2, &merges, &limits, widths, blocked,
+        )
+        .unwrap();
+        assert_eq!(wrapped, limits.max_row_lines as u8);
+    }
+
+    #[test]
+    fn display_row_height_uses_wrap_heights_only_in_xlsx_priority_mode() {
+        let layout = LayoutSnapshot {
+            column_widths: vec![6],
+            row_heights: vec![2, 1],
+            fixed_columns: BTreeSet::from([0]),
+            fixed_rows: BTreeSet::new(),
+            wrap_row_heights: BTreeMap::from([(0, 5)]),
+        };
+        assert_eq!(layout.display_row_height(0, true), 5);
+        assert_eq!(layout.display_row_height(0, false), 2);
+        assert_eq!(layout.display_row_height(1, true), 1);
     }
 
     #[test]

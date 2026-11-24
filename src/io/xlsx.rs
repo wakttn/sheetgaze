@@ -3,6 +3,7 @@ use std::io::BufReader;
 use std::path::Path;
 
 use calamine::{Data, DataRef, Reader, Xlsx};
+use unicode_width::UnicodeWidthStr;
 
 use crate::domain::addr::{CellAddr, CellRange};
 use crate::domain::cell::{Cell, CellValue};
@@ -13,7 +14,10 @@ use crate::domain::filter::{
 };
 use crate::domain::formula::{FormulaInfo, FormulaOverlay, FormulaStatus};
 use crate::domain::freeze::FreezePane;
-use crate::domain::layout::{LayoutLimits, LayoutMode, LayoutStatsBuilder};
+use crate::domain::layout::{
+    CELL_GUTTER, LayoutLimits, LayoutMode, LayoutSnapshot, LayoutStatsBuilder, OverflowSlot,
+    excel_column_width, overflow_wrap_lines, wrapped_line_count,
+};
 use crate::domain::merge::{MergeIndex, MergeRegion};
 use crate::domain::row_store::LazyConfig;
 use crate::domain::row_store::{LazySheet, MemoryRowSource, Row, RowSource};
@@ -28,6 +32,194 @@ use super::sheet_meta::SheetMetadataParser;
 /// empty cells. The style range is usually close to the used range, but a
 /// pathological file can style two distant cells and force a huge sparse scan.
 const MAX_EMPTY_STYLED_CELLS: u64 = 4_000_000;
+
+#[derive(Clone, Copy, Debug)]
+enum SpillStop {
+    Before(u32),
+    After(u32),
+}
+
+#[derive(Clone, Debug)]
+struct WrapCandidate {
+    row: u32,
+    col: u32,
+    display: String,
+    own_right_border: bool,
+    stop: Option<SpillStop>,
+}
+
+fn collect_eager_wrap_heights(
+    layout: &mut LayoutSnapshot,
+    cells: &HashMap<CellAddr, Cell>,
+    merges: &MergeIndex,
+    used_range: CellRange,
+    limits: &LayoutLimits,
+) {
+    if layout.fixed_columns.is_empty() {
+        return;
+    }
+    let used_end_col = used_range.end.col;
+    let mut heights = BTreeMap::new();
+    for (addr, cell) in cells {
+        if !layout.fixed_columns.contains(&addr.col) || merges.region_at(*addr).is_some() {
+            continue;
+        }
+        let own_width = layout
+            .column_widths
+            .get(addr.col as usize)
+            .copied()
+            .unwrap_or(limits.default_col_width)
+            .max(1);
+        let Some(lines) = overflow_wrap_lines(
+            &cell.display,
+            cell.wrap_text,
+            addr.row,
+            addr.col,
+            own_width,
+            cell.style.borders,
+            used_end_col,
+            merges,
+            limits,
+            |col| {
+                layout
+                    .column_widths
+                    .get(col as usize)
+                    .copied()
+                    .unwrap_or(limits.default_col_width)
+                    .max(1)
+            },
+            |col| {
+                cells
+                    .get(&CellAddr::new(addr.row, col))
+                    .map(OverflowSlot::from_cell)
+            },
+        ) else {
+            continue;
+        };
+        heights
+            .entry(addr.row)
+            .and_modify(|height: &mut u8| *height = (*height).max(lines))
+            .or_insert(lines);
+    }
+    for (row, height) in heights {
+        layout.grow_wrap_height(row, height);
+    }
+}
+
+fn find_spill_stop(
+    row: u32,
+    col: u32,
+    own_right_border: bool,
+    cells: &[(u32, Cell)],
+    merges: &MergeIndex,
+) -> Option<SpillStop> {
+    if own_right_border {
+        return Some(SpillStop::Before(col.saturating_add(1)));
+    }
+    let merge_start = merges
+        .regions_overlapping_row(row)
+        .filter_map(|region| {
+            if region.range.end.col <= col {
+                None
+            } else {
+                Some(region.range.start.col.max(col.saturating_add(1)))
+            }
+        })
+        .min();
+    for (cell_col, cell) in cells.iter().filter(|(cell_col, _)| *cell_col > col) {
+        if merge_start.is_some_and(|start| start <= *cell_col) {
+            return merge_start.map(SpillStop::Before);
+        }
+        let slot = OverflowSlot::from_cell(cell);
+        if !slot.empty || slot.left_border {
+            return Some(SpillStop::Before(*cell_col));
+        }
+        if slot.right_border {
+            return Some(SpillStop::After(*cell_col));
+        }
+    }
+    merge_start.map(SpillStop::Before)
+}
+
+fn collect_lazy_wrap_candidates(
+    row: u32,
+    cells: &[(u32, Cell)],
+    fixed_widths: &BTreeMap<u32, u16>,
+    merges: &MergeIndex,
+    candidates: &mut Vec<WrapCandidate>,
+) {
+    for (col, cell) in cells {
+        let Some(&own_width) = fixed_widths.get(col) else {
+            continue;
+        };
+        let addr = CellAddr::new(row, *col);
+        if merges.region_at(addr).is_some()
+            || cell.wrap_text
+            || cell.display.contains('\n')
+            || UnicodeWidthStr::width(cell.display.as_str()) <= own_width as usize
+        {
+            continue;
+        }
+        candidates.push(WrapCandidate {
+            row,
+            col: *col,
+            display: cell.display.clone(),
+            own_right_border: cell.style.borders.right.is_visible(),
+            stop: find_spill_stop(
+                row,
+                *col,
+                cell.style.borders.right.is_visible(),
+                cells,
+                merges,
+            ),
+        });
+    }
+}
+
+fn apply_lazy_wrap_heights(
+    layout: &mut LayoutSnapshot,
+    candidates: &[WrapCandidate],
+    used_end_col: u32,
+    limits: &LayoutLimits,
+) {
+    for candidate in candidates {
+        let width_of = |col: u32| {
+            layout
+                .column_widths
+                .get(col as usize)
+                .copied()
+                .unwrap_or(limits.default_col_width)
+                .max(1)
+        };
+        let own_width = width_of(candidate.col);
+        let mut width = own_width;
+        if !candidate.own_right_border {
+            let limit = match candidate.stop {
+                Some(SpillStop::Before(col)) => col.saturating_sub(1).min(used_end_col),
+                Some(SpillStop::After(col)) => col.min(used_end_col),
+                None => used_end_col,
+            };
+            if limit > candidate.col {
+                for col in (candidate.col.saturating_add(1))..=limit {
+                    let after_border = matches!(
+                        candidate.stop,
+                        Some(SpillStop::After(stop)) if stop == col
+                    );
+                    width = width
+                        .saturating_add(width_of(col))
+                        .saturating_add(if after_border { 0 } else { CELL_GUTTER });
+                }
+            }
+        }
+        if UnicodeWidthStr::width(candidate.display.as_str()) <= width as usize {
+            continue;
+        }
+        let lines = wrapped_line_count(&candidate.display, width)
+            .min(limits.max_row_lines as u8)
+            .max(1);
+        layout.grow_wrap_height(candidate.row, lines);
+    }
+}
 
 pub fn load_xlsx(
     path: &Path,
@@ -170,7 +362,8 @@ pub fn load_xlsx_with_mode(
             .then(|| metadata.get(&sheet_name).map(|meta| &meta.layout))
             .flatten()
             .filter(|layout| !layout.is_empty());
-        let layout = stats.finish(&merges, excel_layout, used_range);
+        let mut layout = stats.finish(&merges, excel_layout, used_range);
+        collect_eager_wrap_heights(&mut layout, &cells, &merges, used_range, layout_limits);
         let mut warnings = Vec::new();
         let mut freeze = metadata
             .get(&sheet_name)
@@ -347,6 +540,19 @@ fn load_xlsx_lazy(
                 })
                 .collect(),
         );
+        let excel_layout = (layout_mode == LayoutMode::Excel)
+            .then(|| metadata.get(&sheet_name).map(|meta| &meta.layout))
+            .flatten()
+            .filter(|layout| !layout.is_empty());
+        let fixed_widths: BTreeMap<u32, u16> = excel_layout
+            .map(|layout| {
+                layout
+                    .column_widths
+                    .iter()
+                    .map(|(&col, &width)| (col, excel_column_width(width, layout_limits)))
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut reader = match workbook.worksheet_cells_reader(&sheet_name) {
             Ok(reader) => reader,
             Err(_) => continue,
@@ -357,6 +563,7 @@ fn load_xlsx_lazy(
         let mut stats = LayoutStatsBuilder::new(layout_limits);
         let mut current_row: Option<u32> = None;
         let mut row_cells: Vec<(u32, Cell)> = Vec::new();
+        let mut wrap_candidates: Vec<WrapCandidate> = Vec::new();
         let mut next_row_to_write = 0u32;
         let merge_max_row = merges
             .regions()
@@ -432,6 +639,14 @@ fn load_xlsx_lazy(
                 }
                 if current_row != Some(row) {
                     if let Some(previous) = current_row {
+                        row_cells.sort_by_key(|(col, _)| *col);
+                        collect_lazy_wrap_candidates(
+                            previous,
+                            &row_cells,
+                            &fixed_widths,
+                            &merges,
+                            &mut wrap_candidates,
+                        );
                         cache.write_row(&Row {
                             row: previous,
                             cells: std::mem::take(&mut row_cells),
@@ -451,6 +666,14 @@ fn load_xlsx_lazy(
             }
         }
         if let Some(previous) = current_row {
+            row_cells.sort_by_key(|(col, _)| *col);
+            collect_lazy_wrap_candidates(
+                previous,
+                &row_cells,
+                &fixed_widths,
+                &merges,
+                &mut wrap_candidates,
+            );
             cache.write_row(&Row {
                 row: previous,
                 cells: std::mem::take(&mut row_cells),
@@ -466,11 +689,13 @@ fn load_xlsx_lazy(
         }
         drop(reader);
         let used_range = CellRange::new(CellAddr::new(0, 0), CellAddr::new(max_row, max_col));
-        let excel_layout = (layout_mode == LayoutMode::Excel)
-            .then(|| metadata.get(&sheet_name).map(|meta| &meta.layout))
-            .flatten()
-            .filter(|layout| !layout.is_empty());
-        let layout = stats.finish(&merges, excel_layout, used_range);
+        let mut layout = stats.finish(&merges, excel_layout, used_range);
+        apply_lazy_wrap_heights(
+            &mut layout,
+            &wrap_candidates,
+            used_range.end.col,
+            layout_limits,
+        );
         let mut warnings = Vec::new();
         let mut freeze = metadata
             .get(&sheet_name)

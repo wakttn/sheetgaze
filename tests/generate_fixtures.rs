@@ -54,6 +54,7 @@ fn generate_fixtures() -> FixtureResult {
     merged_tail(&dir)?;
     overflow(&dir)?;
     excel_layout(&dir)?;
+    excel_width_wrap(&dir)?;
     freeze_rows(&dir)?;
     freeze_both(&dir)?;
     freeze_merge_conflict(&dir)?;
@@ -295,6 +296,48 @@ fn excel_layout(dir: &Path) -> FixtureResult {
     defaults.write_string(0, 0, "default row height")?;
 
     save(&mut workbook, dir, "excel_layout.xlsx")
+}
+
+fn excel_width_wrap(dir: &Path) -> FixtureResult {
+    let mut workbook = new_workbook()?;
+    let sheet = workbook.add_worksheet();
+    sheet.set_name("Width Wrap")?;
+    sheet.set_column_width(0, 6)?;
+    sheet.set_column_width(1, 8)?;
+    sheet.set_column_width(2, 10)?;
+
+    let long = "0123456789".repeat(4);
+    let very_long = "0123456789".repeat(20);
+
+    // A1:B1 can spill, but the text is longer than the combined width.
+    sheet.write_string(0, 0, &long)?;
+    sheet.write_string(0, 2, "blocked")?;
+
+    // A2:B2 is wide enough for the whole value, so it should spill.
+    sheet.write_string(1, 0, "0123456789ab")?;
+    sheet.write_string(1, 2, "blocked")?;
+
+    // B3 blocks the spill immediately.
+    sheet.write_string(2, 0, &long)?;
+    sheet.write_string(2, 1, "blocked")?;
+
+    // A border on the empty neighbour also blocks the spill.
+    sheet.write_string(3, 0, &long)?;
+    sheet.write_blank(3, 1, &Format::new().set_border_left(FormatBorder::Thin))?;
+
+    // The explicit two-line row height is only a lower bound.
+    sheet.set_row_height(4, 30)?;
+    sheet.write_string(4, 0, &long)?;
+    sheet.write_string(4, 2, "blocked")?;
+
+    // Both columns are explicit-width, so the merged cell wraps at 6 + 8 + 1.
+    sheet.merge_range(5, 0, 5, 1, &long, &Format::new())?;
+
+    // The default max-row-lines cap applies to extreme values.
+    sheet.write_string(7, 0, &very_long)?;
+    sheet.write_string(7, 1, "blocked")?;
+
+    save(&mut workbook, dir, "excel_width_wrap.xlsx")
 }
 
 fn overflow(dir: &Path) -> FixtureResult {

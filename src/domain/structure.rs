@@ -532,6 +532,7 @@ fn insert_cols(sheet: &mut Sheet, index: u32, count: u32) {
         sheet.freeze.frozen_cols = sheet.freeze.frozen_cols.saturating_add(count);
     }
     shift_cells(sheet, Axis::Column, index, count, true);
+    sheet.recompute_wrap_heights();
     sheet.invalidate_filter_masks();
 }
 
@@ -630,6 +631,7 @@ fn delete_cols(sheet: &mut Sheet, index: u32, count: u32) -> RemovedCells {
         .retain(|addr| !(addr.col >= index && addr.col < end));
     shift_formula_cells(&mut sheet.formula_cells, Axis::Column, index, count, false);
     shift_rewrites_after_delete(sheet, Axis::Column, index, count);
+    sheet.recompute_wrap_heights();
     sheet.invalidate_filter_masks();
     removed
 }
@@ -761,6 +763,17 @@ fn shift_layout_rows_insert(layout: &mut LayoutSnapshot, index: u32, count: u32)
             }
         })
         .collect();
+    layout.wrap_row_heights = std::mem::take(&mut layout.wrap_row_heights)
+        .into_iter()
+        .map(|(row, height)| {
+            let row = if row >= index as u32 {
+                row.saturating_add(count)
+            } else {
+                row
+            };
+            (row, height)
+        })
+        .collect();
 }
 
 fn shift_layout_rows_delete(layout: &mut LayoutSnapshot, index: u32, count: u32) {
@@ -781,6 +794,20 @@ fn shift_layout_rows_delete(layout: &mut LayoutSnapshot, index: u32, count: u32)
                 None
             } else {
                 Some(*row)
+            }
+        })
+        .collect();
+    let wrap_start = index;
+    let wrap_end = index.saturating_add(count);
+    layout.wrap_row_heights = std::mem::take(&mut layout.wrap_row_heights)
+        .into_iter()
+        .filter_map(|(row, height)| {
+            if row >= wrap_start && row < wrap_end {
+                None
+            } else if row >= wrap_end {
+                Some((row.saturating_sub(count), height))
+            } else {
+                Some((row, height))
             }
         })
         .collect();

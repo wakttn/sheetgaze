@@ -10,8 +10,11 @@ use crate::domain::filter::{
 };
 use crate::domain::formula::{FormulaOverlay, FormulaStatus};
 use crate::domain::freeze::FreezePane;
-use crate::domain::layout::{LayoutLimits, LayoutSnapshot};
-use crate::domain::merge::MergeIndex;
+use crate::domain::layout::{
+    CELL_GUTTER, LayoutLimits, LayoutSnapshot, OverflowSlot, overflow_wrap_lines,
+    wrapped_line_count,
+};
+use crate::domain::merge::{MergeIndex, MergeRegion};
 use crate::domain::row_store::{LazySheet, RowRange};
 use crate::domain::style::CellBorders;
 
@@ -243,7 +246,132 @@ impl Sheet {
         if self.cell(anchor).is_some_and(|cell| cell.formula.is_some()) {
             self.formula_cells.push(anchor);
         }
+        if let Some(region) = self.merges.region_at(anchor).copied() {
+            self.refresh_wrap_merge(region);
+        } else {
+            self.refresh_wrap_row(anchor.row);
+        }
         self.invalidate_filter_masks();
+    }
+
+    /// Re-evaluates the extra row height needed to wrap text inside explicit
+    /// Excel column widths. Growth is monotonic, matching the existing
+    /// grow-only layout updates.
+    pub fn refresh_wrap_row(&mut self, row: u32) {
+        if self.layout.fixed_columns.is_empty() || row > self.used_range.end.row {
+            return;
+        }
+        let used_end_col = self.used_range.end.col;
+        let lines = {
+            let layout = &self.layout;
+            let merges = &self.merges;
+            let limits = self.layout_limits;
+            (0..=used_end_col)
+                .filter(|col| layout.fixed_columns.contains(col))
+                .filter_map(|col| {
+                    let addr = CellAddr::new(row, col);
+                    if merges.region_at(addr).is_some() {
+                        return None;
+                    }
+                    let cell = self.cell(addr)?;
+                    let own_width = layout
+                        .column_widths
+                        .get(col as usize)
+                        .copied()
+                        .unwrap_or(limits.default_col_width)
+                        .max(1);
+                    overflow_wrap_lines(
+                        &cell.display,
+                        cell.wrap_text,
+                        row,
+                        col,
+                        own_width,
+                        cell.style.borders,
+                        used_end_col,
+                        merges,
+                        &limits,
+                        |col| {
+                            layout
+                                .column_widths
+                                .get(col as usize)
+                                .copied()
+                                .unwrap_or(limits.default_col_width)
+                                .max(1)
+                        },
+                        |col| {
+                            self.cell(CellAddr::new(row, col))
+                                .map(OverflowSlot::from_cell)
+                        },
+                    )
+                })
+                .max()
+        };
+        if let Some(lines) = lines {
+            self.layout.grow_wrap_height(row, lines);
+        }
+    }
+
+    /// Re-evaluates a merged range that includes an explicit Excel column.
+    pub fn refresh_wrap_merge(&mut self, region: MergeRegion) {
+        if self.layout.fixed_columns.is_empty()
+            || !region
+                .range
+                .cols()
+                .any(|col| self.layout.fixed_columns.contains(&col))
+        {
+            return;
+        }
+        let cols = region.range.col_count().max(1) as u16;
+        let total_width = region
+            .range
+            .cols()
+            .map(|col| {
+                self.layout
+                    .column_widths
+                    .get(col as usize)
+                    .copied()
+                    .unwrap_or(self.layout_limits.default_col_width)
+                    .max(1)
+            })
+            .sum::<u16>()
+            .saturating_add(cols.saturating_sub(1) * CELL_GUTTER);
+        let per_row = {
+            let Some(cell) = self.cell(region.anchor) else {
+                return;
+            };
+            if cell.wrap_text || cell.display.contains('\n') {
+                return;
+            }
+            if unicode_width::UnicodeWidthStr::width(cell.display.as_str()) <= total_width as usize
+            {
+                return;
+            }
+            let lines = wrapped_line_count(&cell.display, total_width)
+                .min(self.layout_limits.max_row_lines as u8)
+                .max(1) as u32;
+            let rows = region.range.row_count().max(1);
+            lines.div_ceil(rows).max(1) as u8
+        };
+        for row in region.range.rows() {
+            self.layout.grow_wrap_height(row, per_row);
+        }
+    }
+
+    /// Rebuilds all explicit-width wrap heights. Used after column structure
+    /// changes, where the previous heights no longer match the column widths.
+    pub fn recompute_wrap_heights(&mut self) {
+        self.layout.wrap_row_heights.clear();
+        if self.layout.fixed_columns.is_empty() {
+            return;
+        }
+        let last_row = self.used_range.end.row;
+        for row in 0..=last_row {
+            self.refresh_wrap_row(row);
+        }
+        let regions: Vec<MergeRegion> = self.merges.regions().to_vec();
+        for region in regions {
+            self.refresh_wrap_merge(region);
+        }
     }
 
     fn extend_bounds(&mut self, addr: CellAddr) {
